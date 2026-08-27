@@ -23,7 +23,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .base import Generation, TokenStats
+from .base import Generation, SamplingParams, TokenStats
 
 
 def _require_llama_cpp():
@@ -111,14 +111,23 @@ class LlamaCppLM:
         return self._llm.tokenize(text.encode("utf-8"), add_bos=add_bos, special=True)
 
     # -- interface ---------------------------------------------------------
-    def generate(self, messages: Sequence[dict], *, temperature: float, seed: int,
-                 max_tokens: int = 128, stop: Sequence[str] | None = None) -> Generation:
+    def generate(self, messages: Sequence[dict], *, params: SamplingParams,
+                 seed: int) -> Generation:
         self._llm.set_seed(int(seed))
+        # Every truncation knob is passed EXPLICITLY. llama.cpp's defaults are
+        # top_k=40, top_p=0.95, min_p=0.05, repeat_penalty=1.1, so omitting them
+        # would sample from a truncated, repetition-penalised distribution while
+        # the config claims the decoder is unrestricted. That damps the effect of
+        # raising T and understates the 8.1 result.
         out = self._llm.create_chat_completion(
             messages=list(messages),
-            temperature=float(temperature),
-            max_tokens=int(max_tokens),
-            stop=list(stop) if stop else None,
+            temperature=float(params.temperature),
+            max_tokens=int(params.max_tokens),
+            stop=list(params.stop) if params.stop else None,
+            top_p=float(params.top_p),
+            top_k=int(params.top_k),
+            min_p=float(params.min_p),
+            repeat_penalty=float(params.repeat_penalty),
             seed=int(seed),
         )
         choice = out["choices"][0]
@@ -204,8 +213,11 @@ class LlamaCppNLI:
 
     def entailment_prob(self, premise: str, hypothesis: str) -> float:
         from ..prompts import build_nli
-        gen = self.lm.generate(build_nli(premise, hypothesis), temperature=0.0,
-                               seed=self.seed, max_tokens=self.max_tokens)
+        # Greedy and unrestricted: an entailment verdict must not vary run to run.
+        gen = self.lm.generate(
+            build_nli(premise, hypothesis),
+            params=SamplingParams(temperature=0.0, max_tokens=self.max_tokens),
+            seed=self.seed)
         text = gen.text.strip().lower()
         if text.startswith("entail"):
             return 1.0

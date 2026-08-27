@@ -32,7 +32,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .base import Generation, TokenStats
+from .base import Generation, SamplingParams, TokenStats
 
 SEM_TAG = re.compile(r"\[\[sem:([^\]]+)\]\]")
 
@@ -175,8 +175,13 @@ class MockLM:
         return TokenStats(entropies=ent, logprobs=np.log(probs), chosen_probs=probs)
 
     # -- interface ---------------------------------------------------------
-    def generate(self, messages: Sequence[dict], *, temperature: float, seed: int,
-                 max_tokens: int = 128, stop: Sequence[str] | None = None) -> Generation:
+    def generate(self, messages: Sequence[dict], *, params: SamplingParams,
+                 seed: int) -> Generation:
+        temperature, max_tokens = params.temperature, params.max_tokens
+        # The simulated world responds to T only. Truncation knobs are recorded
+        # so a test can assert they were threaded through, but they do not shape
+        # the mock distribution -- pretending otherwise would invent an effect.
+        self.last_params = params
         meta = self._meta(messages)
         q_id = meta.get("qid", self._field(messages, "Question") or "q?")
         dataset = meta.get("ds", "unknown")

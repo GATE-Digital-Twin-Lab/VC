@@ -25,6 +25,7 @@ import pandas as pd
 
 from . import prompts
 from .config import Config
+from .backends.base import SamplingParams
 from .generate import Generator, _mock_meta, derive_seed
 from .parsing import parse_answer_and_vc, parse_vc_only
 from .stats import NAN
@@ -176,9 +177,7 @@ def sycophancy_probe(cfg: Config, gen: Generator, questions: pd.DataFrame,
                                      "variant": "vc_post_v1", "scale": "unit",
                                      "kind": "post"})
         seed = derive_seed(int(cfg.get("run.seed")), "syco", r["q_id"])
-        gen_out = gen.lm.generate(msgs, temperature=float(cfg.get("generation.temperature")),
-                                  seed=seed,
-                                  max_tokens=int(cfg.get("model.generation.max_tokens")))
+        gen_out = gen.lm.generate(msgs, params=gen.sampling, seed=seed)
         parsed = parse_answer_and_vc(gen_out.text, "unit", require_answer=False)
         rows.append({"q_id": r["q_id"], "vc_before": r["vc_post"],
                      "vc_after": parsed.vc, "answer": r["answer"]})
@@ -213,7 +212,6 @@ def forced_decode(cfg: Config, gen: Generator, questions: pd.DataFrame,
     values = list(cfg.get("phase5.forced_decode.injected_values"))
     n_draws = int(cfg.get("phase5.forced_decode.n_draws"))
     temperature = float(cfg.get("generation.temperature"))
-    max_tokens = int(cfg.get("model.generation.max_tokens"))
 
     rows = []
     for val in values:
@@ -227,8 +225,7 @@ def forced_decode(cfg: Config, gen: Generator, questions: pd.DataFrame,
                                              "injected": val})
                 seed = derive_seed(int(cfg.get("run.seed")), "forced", q["q_id"],
                                    draw_idx, val)
-                out = gen.lm.generate(msgs, temperature=temperature, seed=seed,
-                                      max_tokens=max_tokens)
+                out = gen.lm.generate(msgs, params=gen.sampling, seed=seed)
                 parsed = parse_answer_and_vc(out.text, "unit", require_answer=False)
                 rows.append({"q_id": q["q_id"], "dataset": q["dataset"],
                              "split": q.get("split", "eval"), "draw_idx": draw_idx,
@@ -274,7 +271,7 @@ def prehoc_probes(cfg: Config, questions: pd.DataFrame,
 
     fab = questions[questions["dataset"] == "fabricated"]
     real = questions[questions["dataset"] != "fabricated"]
-    if len(fab) and len(real):
+    if bool(cfg.get("phase5.prehoc_probes.fabricated")) and len(fab) and len(real):
         out["fabricated"] = {
             "n_fabricated": int(len(fab)),
             "mean_vc_pre_fabricated": float(fab["vc_pre"].mean()),
@@ -288,7 +285,7 @@ def prehoc_probes(cfg: Config, questions: pd.DataFrame,
                 else "vc_pre drops on fabricated entities"),
         }
 
-    if not vc_pre_repeats.empty:
+    if bool(cfg.get("phase5.prehoc_probes.repeat_variance")) and not vc_pre_repeats.empty:
         per_q = (vc_pre_repeats.groupby("q_id")["vc_pre"]
                  .agg(sd="std", vmin="min", vmax="max", n="count").reset_index())
         out["repeat_stability"] = {

@@ -43,6 +43,7 @@ def discreteness_summary(df: pd.DataFrame, col: str,
     if hist.empty:
         return {"column": col, "n_distinct": 0}
     top = hist.nlargest(top_k, "n")
+    
     return {
         "column": col,
         "n_distinct": int(len(hist)),
@@ -60,6 +61,7 @@ def reliability(df: pd.DataFrame, cfg: Config, *, vc_col: str = "vc_post",
     n_res = int(cfg.get("phase2.bootstrap.n_resamples"))
     ci = float(cfg.get("phase2.bootstrap.ci"))
     seed = int(cfg.get("run.seed"))
+    
     sub = df.dropna(subset=[vc_col, label_col]).copy()
     if sub.empty:
         return pd.DataFrame()
@@ -88,9 +90,11 @@ def reliability(df: pd.DataFrame, cfg: Config, *, vc_col: str = "vc_post",
             "calibration_gap": est.value - v_g,
             "abs_gap": abs(est.value - v_g),
         })
+        
     out = pd.DataFrame(rows).sort_values("v_g").reset_index(drop=True)
     min_n = int(cfg.get("phase2.min_group_n"))
     out["reportable"] = out["n_g"] >= min_n
+    
     return out
 
 
@@ -101,8 +105,10 @@ def monotonicity(rel: pd.DataFrame) -> dict:
     if len(sub) < 2:
         return {"monotone": None, "n_groups": int(len(sub))}
     diffs = np.diff(sub["p_hat_g"].to_numpy())
+    
     from scipy.stats import spearmanr
     rho, p = spearmanr(sub["v_g"], sub["p_hat_g"])
+    
     return {"monotone": bool(np.all(diffs >= -1e-12)),
             "n_inversions": int(np.sum(diffs < -1e-12)),
             "spearman_rho": float(rho), "spearman_p": float(p),
@@ -139,6 +145,7 @@ def information_gain(questions: pd.DataFrame, cfg: Config) -> dict:
         lambda d: auroc_frame(d, "vc_pre", "_label"),
         group="q_id", n_resamples=int(cfg.get("phase2.bootstrap.n_resamples")),
         ci=float(cfg.get("phase2.bootstrap.ci")), seed=int(cfg.get("run.seed")))
+    
     return {
         "auroc_vc_pre": a_pre, "auroc_vc_1": a_1,
         "delta_post_minus_pre": delta.value, "delta_lo": delta.lo, "delta_hi": delta.hi,
@@ -168,15 +175,19 @@ def two_aurocs(answers: pd.DataFrame, questions: pd.DataFrame,
     # an empty frame.
     q = (questions.dropna(subset=["p_hat"]).copy()
          if len(questions) and "p_hat" in questions.columns else pd.DataFrame())
+    
     if len(q):
         q["_label"] = q["p_hat"] > 0
+    
     for col in ("vc_pre", "vc_1", "vc_bar"):
         if not len(q) or col not in q.columns or q[col].isna().all() \
                 or q["_label"].nunique() < 2:
             continue
+    
         sub = q.dropna(subset=[col])
         est = cluster_bootstrap(sub, lambda d, c=col: auroc_frame(d, c, "_label"),
                                 group="q_id", n_resamples=n_res, ci=ci, seed=seed)
+        
         rows.append({"level": "between_question", "signal": col, "auroc": est.value,
                      "lo": est.lo, "hi": est.hi, "n": int(len(sub))})
 
@@ -186,9 +197,11 @@ def two_aurocs(answers: pd.DataFrame, questions: pd.DataFrame,
         # h_tok and s_anchor point the other way: more entropy / more distance
         # from the anchor should mean LESS likely correct.
         direction = -1.0 if col in ("h_tok_mean", "s_anchor") else 1.0
+        
         tmp = answers.dropna(subset=[col, "correct"]).copy()
         tmp["_score"] = direction * tmp[col].astype(float)
         res = within_question_auroc(tmp, "_score", "correct", min_per_class=min_pc)
+        
         rows.append({"level": "within_question", "signal": col,
                      "auroc": res["mean_auroc"],
                      "lo": res["mean_auroc"] - 1.96 * res["se"]
@@ -196,6 +209,7 @@ def two_aurocs(answers: pd.DataFrame, questions: pd.DataFrame,
                      "hi": res["mean_auroc"] + 1.96 * res["se"]
                      if not np.isnan(res.get("se", NAN)) else NAN,
                      "n": res["n_questions"]})
+    
     return pd.DataFrame(rows)
 
 

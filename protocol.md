@@ -554,7 +554,12 @@ Phases 2-4 establish poor *quality*, which isotonic regression could in principl
 These show VC violates properties any estimator of `p_q` must satisfy.
 
 1. **Temperature sweep**, `T in [0, 1.5]`, prompt fixed. Measure `p_hat_q` (moves a lot)
-   and VC (has no argument for `T` and will barely move). `p_q` is definitionally a
+   and VC (has no argument for `T` and will barely move).
+   **`T` must be the only thing that varies.** Truncation sampling (`top_p`, `top_k`,
+   `min_p`) and repetition penalties reshape the distribution independently of `T`,
+   so they must be disabled and passed explicitly rather than left to backend
+   defaults. A truncated tail damps the movement in `p_hat_q` and understates the
+   very effect being measured. `tau` must likewise be held fixed across the sweep. `p_q` is definitionally a
    function of the decoder; VC is not. **Cheapest experiment with the strongest payoff —
    run this first.**
 2. **Elicitation paraphrase**, 10 semantically equivalent prompts. Report per-question
@@ -614,6 +619,10 @@ non-invariance are already a contribution.
 - [ ] Same draws used to classify `A` and to calibrate (voids guarantee)
 - [ ] `tau` selected and LTT run on the same split (voids guarantee)
 - [ ] `lambda_hat` selected on `calib` rather than `eval`
+- [ ] Sampling truncation left at the backend's defaults, so the decoder is not a
+      function of `T` alone. llama.cpp ships `top_k=40, top_p=0.95, min_p=0.05,
+      repeat_penalty=1.1`; passing nothing silently truncates the tail, damps the
+      effect of raising `T`, and understates 8.1. Pass every knob explicitly.
 - [ ] Product rule accumulated as a running product rather than `sum log(1 - vc)`
       (underflows at large `k`; collapses the Phase 4 grid quantiles)
 - [ ] `vc = 1.0` left unclamped, so one answer zeroes `Pi_k` and satisfies every threshold

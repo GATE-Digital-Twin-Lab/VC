@@ -7,8 +7,8 @@ run:
   data_root: data
   results_root: results
   # Cache key = (model, dataset, q_id, draw_idx, T, prompt_variant, seed).
-  # Generation is append-only; downstream phases are pure functions of the cache.
-  cache_append_only: true
+  # Generation is append-only and downstream phases are pure functions of the
+  # cache. That is structural in store.py, not a switch.
   # Derived output (tables, figures, processed parquet) goes to
   #   <results_root>/<runs_subdir>/<timestamp>__<run.name>/
   # The raw generation cache does NOT live there: it is shared across runs and
@@ -51,15 +51,21 @@ model:
     n_batch: 512
     main_gpu: 0
     tensor_split: null        # e.g. [0.5, 0.5] to split across the two 5090s
-    logits_all: false         # set by the caller per-call; teacher forcing forces true
     flash_attn: true
     verbose: false
     chat_format: null         # null = use the GGUF's own chat template
   generation:
+    # The complete decoder specification. Every one of these is passed
+    # EXPLICITLY on every call (backends/base.py SamplingParams), because
+    # backend defaults are not neutral: llama.cpp ships top_k=40, top_p=0.95,
+    # min_p=0.05, repeat_penalty=1.1. p_q is definitionally a function of the
+    # decoder, so the 8.1 temperature sweep only measures T if T is the only
+    # thing shaping the distribution. The values below are the unrestricted
+    # decoder the protocol requires; a pitfall check fails if they are narrowed.
     max_tokens: 128
     stop: ["\n\n", "</s>", "<|eot_id|>"]
-    top_p: 1.0                # keep the decoder unrestricted: p_q must be a function of T alone
-    top_k: 0
+    top_p: 1.0
+    top_k: 0                  # 0 = disabled
     min_p: 0.0
     repeat_penalty: 1.0
 
@@ -133,7 +139,9 @@ generation:
     # and full arrays for a subsample (protocol 4).
     store_per_position_fraction: 0.10
     teacher_force_clean_prompt: true      # h_tok under a non-augmented prompt too
-  fresh_context_per_draw: true            # no chat history across draws
+  # No chat history across draws. Setting this false raises: dependent draws
+  # would make every independence statement in 5.7 and 6.7 untestable.
+  fresh_context_per_draw: true
 
 anchor:
   # anchor(q) must be DETERMINISTIC and built identically at calib and test.
@@ -154,9 +162,18 @@ phase0:
     auroc_min: 0.85
   null_band:
     n_mismatched_pairs: 5000  # e_cos on (a_i, a_star_j), i != j
-    overlap_metric: auroc     # observed vs null band separation
     overlap_min_auroc: 0.75   # below this the instrument cannot resolve the effect
   tau_sensitivity: 0.05       # re-report every headline at tau_star +/- this
+  labels:
+    # Hand labels are the one irreproducible input in the study, so only
+    # correct_human is taken from the CSV; e_cos and everything else is
+    # recomputed. e_cos is NOT a stable property of a pair -- the embedding
+    # space is mean-centred over whichever texts were scored together -- so a
+    # stale value from an old CSV would select tau_star against numbers that no
+    # longer exist.
+    shuffle_sheet: true       # partial labelling must not silently destratify
+    min_per_stratum: 1        # refuse if any stratum has no labelled pair
+    min_coverage: 0.5         # warn below this share of the sheet labelled
 
 phase2:
   # Reliability: ANSWER-level grouping by vc_post is primary. VC's discreteness
@@ -188,11 +205,18 @@ phase4:
   alphas: [0.05, 0.1, 0.2]
   delta: 0.1
   restrict_to_A: true         # primary; beta_eff = 0. States it conditions on solvability.
-  robustness_alphas: [0.2, 0.3]   # used when running on all questions
+  # 7.1 robustness: repeat the comparison on ALL questions (U included) at
+  # alphas above beta. Values at or below beta are skipped, since no rule of
+  # any kind is certifiable there and the table would be blank by arithmetic.
+  robustness_alphas: [0.2, 0.3]
   grid:
     lambda_qual: {start: 0.0, stop: 1.0, num: 10}
     lambda_div:  {start: 0.0, stop: 0.6, num: 10}
-    lambda_stop: {start: 0.0, stop: 1.0, num: 10}
+    # Only `num` applies to lambda_stop: the rules' statistics live on
+    # incompatible scales (a log-probability, an entropy in nats, a draw
+    # count), so each rule's grid is quantiles of its own observed statistic
+    # rather than a shared numeric range. See clm.rule_stop_grid.
+    lambda_stop: {num: 10}
   stop_rules:
     - vc_product
     - vc_max
@@ -228,9 +252,10 @@ phase5:
     injected_values: [0.3, 0.95]
     n_draws: 20
   prehoc_probes:
-    fabricated: true
-    post_cutoff: true
-    repeat_variance: true
+    fabricated: true          # 8.6(a) invented entities: p_q = 0 by construction
+    repeat_variance: true     # 8.6(c) is the feeling of knowing stable across repeats?
+    # 8.6(b), questions with known-recent answers past the cutoff, needs a
+    # dataset that does not exist here yet; deliberately not listed as a toggle.
 
 phase6:
   fit_on: triviaqa

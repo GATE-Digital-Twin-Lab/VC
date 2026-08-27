@@ -99,7 +99,8 @@ def step1_temperature(state: PipelineState) -> PipelineState:
 # Step 2 -- Phase 0 gate
 # --------------------------------------------------------------------------
 
-def step2_gate(state: PipelineState, *, simulate_labels: bool = False) -> PipelineState:
+def step2_gate(state: PipelineState, *, simulate_labels: bool = False,
+               labels_path: str | None = None) -> PipelineState:
     cfg, store = state.cfg, state.store
     answers, questions = state.answers, state.questions
     embedder = build_embedder(cfg)
@@ -108,17 +109,35 @@ def step2_gate(state: PipelineState, *, simulate_labels: bool = False) -> Pipeli
     scored = judge.judge_nli(cfg, scored, questions)
     state.questions = questions
 
+    # The sheet is rebuilt from the CURRENT scored answers every time, and a
+    # label file contributes only its correct_human column. e_cos moves whenever
+    # the scored population changes, so it must never be carried in from a file.
     sheet = phase0.build_label_sheet(cfg, scored, questions)
+    label_report = None
     if simulate_labels:
         labelled = phase0.simulate_human_labels(sheet, _oracle(scored))
+    elif labels_path:
+        try:
+            labelled, label_report = phase0.load_hand_labels(cfg, sheet, labels_path)
+        except phase0.LabelCoverageError as exc:
+            # Persist the coverage table before failing: the point of refusing is
+            # to say which strata still need labelling.
+            store.write_json("phase0_label_coverage", exc.report)
+            raise
+        store.write_json("phase0_label_coverage", label_report)
+        for w in label_report["warnings"]:
+            state.notes.append(f"Phase 0 labels: {w}")
     else:
         path = store.table_path("phase0_label_sheet")
         store.write_table("phase0_label_sheet", sheet)
         raise SystemExit(
             f"Phase 0 needs hand labels. Wrote {len(sheet)} stratified pairs to {path}.\n"
-            "Fill the correct_human column (TRUE/FALSE) and re-run with "
-            "--labels <path>. Do not skip this: nothing downstream is interpretable "
-            "through an unvalidated criterion.")
+            "Fill the correct_human column (TRUE/FALSE), then re-run with\n"
+            f"    vc_uq gate --labels {path}\n"
+            "Rows are shuffled, so a partially labelled sheet still covers the "
+            "e_cos range. Only q_id, draw_idx and correct_human are read back. "
+            "Do not skip this: nothing downstream is interpretable through an "
+            "unvalidated criterion.")
 
     labelled = labelled.merge(
         scored[["q_id", "draw_idx", "correct_nli"]], on=["q_id", "draw_idx"], how="left")
@@ -134,7 +153,7 @@ def step2_gate(state: PipelineState, *, simulate_labels: bool = False) -> Pipeli
     state.answers = scored
     store.write_processed("answers", scored)
 
-    state.results["step2_gate"] = gate.as_dict()
+    state.results["step2_gate"] = {**gate.as_dict(), "labels": label_report}
     if not gate.passed:
         state.notes.append(
             "Phase 0 gate FAILED: " + "; ".join(gate.reasons) +
@@ -153,6 +172,12 @@ def step3_generate(state: PipelineState) -> PipelineState:
     state.questions = store.read_questions()
     assert_split_by_question(state.answers)
     state.results["step3_generation"] = info
+    for table, r in info["resume"].items():
+        if r["reused_from_cache"]:
+            state.notes.append(
+                f"Phase 1 {table}: reused {r['reused_from_cache']} of "
+                f"{r['requested']} draws from the shared cache and generated "
+                f"{r['generated']}.")
     return state
 
 
@@ -354,6 +379,41 @@ def step6_clm(state: PipelineState) -> PipelineState:
 
     headline = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
     store.write_table("phase4_headline", headline)
+
+    # Robustness pass (protocol 7.1). The primary table conditions on
+    # solvability, which is information unavailable at deployment. This repeats
+    # the comparison on ALL questions -- U included -- at alphas above beta,
+    # where certification is arithmetically possible without that conditioning.
+    if bool(cfg.get("phase4.restrict_to_A")):
+        beta_all = float(state.beta or 0.0)
+        rob_alphas = [float(a) for a in cfg.get("phase4.robustness_alphas")
+                      if float(a) > beta_all]
+        skipped = [float(a) for a in cfg.get("phase4.robustness_alphas")
+                   if float(a) <= beta_all]
+        rob_rows, rob_meta = [], {"beta": beta_all, "alphas_run": rob_alphas,
+                                  "alphas_skipped_below_beta": skipped}
+        if skipped:
+            state.notes.append(
+                f"Phase 4 robustness: alpha in {skipped} is at or below beta = "
+                f"{beta_all:.3f}, so no rule of any kind is certifiable there; "
+                "skipped rather than reported as a blank table.")
+        for alpha in rob_alphas:
+            sub = answers[answers["split"].isin(["calib", "eval"])]
+            all_q = questions[questions["q_id"].isin(set(sub["q_id"]))]
+            rob_calib = build_traces(
+                cfg, answers[answers["split"] == "calib"], all_q, embedder=embedder)
+            rob_eval = build_traces(
+                cfg, answers[answers["split"] == "eval"], all_q, embedder=embedder)
+            if not rob_calib or not rob_eval:
+                continue
+            res = run_phase4(cfg, rob_calib, rob_eval, beta=beta_all,
+                             alpha=alpha, n_max=n_max)
+            if len(res.headline):
+                rob_rows.append(res.headline.assign(alpha=alpha))
+        if rob_rows:
+            store.write_table("phase4_robustness_headline",
+                              pd.concat(rob_rows, ignore_index=True))
+        store.write_json("phase4_robustness_summary", rob_meta)
     store.write_json("phase4_summary", {"beta_used": beta_eff,
                                         "restricted_to_A": bool(cfg.get("phase4.restrict_to_A")),
                                         "per_alpha": per_alpha})
@@ -425,6 +485,7 @@ def step7_invariance_transfer(state: PipelineState) -> PipelineState:
 # --------------------------------------------------------------------------
 
 def run_all(cfg: Config, *, simulate_labels: bool = False,
+            labels_path: str | None = None,
             skip: tuple[str, ...] = (), store: Store | None = None) -> PipelineState:
     from .datasets import build_questions, split_summary
 
@@ -442,7 +503,8 @@ def run_all(cfg: Config, *, simulate_labels: bool = False,
     # it on its own, before anything else exists.
     steps = [
         ("step3_generate", step3_generate),
-        ("step2_gate", lambda s: step2_gate(s, simulate_labels=simulate_labels)),
+        ("step2_gate", lambda s: step2_gate(s, simulate_labels=simulate_labels,
+                                            labels_path=labels_path)),
         ("step1_temperature", step1_temperature),
         ("step4_survival", step4_survival),
         ("step5_descriptive", step5_descriptive),

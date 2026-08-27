@@ -20,9 +20,10 @@ from .calibration import model_defined_ece, reliability
 from .config import Config
 
 
-def fit_isotonic(vc: np.ndarray, correct: np.ndarray):
+def fit_isotonic(vc: np.ndarray, correct: np.ndarray, *,
+                 out_of_bounds: str = "clip"):
     from sklearn.isotonic import IsotonicRegression
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso = IsotonicRegression(out_of_bounds=out_of_bounds, y_min=0.0, y_max=1.0)
     iso.fit(np.asarray(vc, dtype=float), np.asarray(correct, dtype=float))
     return iso
 
@@ -73,7 +74,8 @@ def transfer_study(cfg: Config, answers: pd.DataFrame, *,
             continue
 
         iso = fit_isotonic(src[vc_col].to_numpy(dtype=float),
-                           src["correct"].astype(float).to_numpy())
+                           src["correct"].astype(float).to_numpy(),
+                           out_of_bounds=cfg.get("phase6.isotonic.out_of_bounds"))
 
         before_in = calibration_gap(src, cfg, vc_col)
         src_cal = src.assign(**{f"{vc_col}_cal": iso.predict(
@@ -130,7 +132,8 @@ def isotonic_preserves_compounding(cfg: Config, answers: pd.DataFrame,
     if sub.empty:
         return pd.DataFrame()
     iso = fit_isotonic(sub[vc_col].to_numpy(dtype=float),
-                       sub["correct"].astype(float).to_numpy())
+                       sub["correct"].astype(float).to_numpy(),
+                       out_of_bounds=cfg.get("phase6.isotonic.out_of_bounds"))
     raw = product_rule_divergence(product_rule_curve(sub, cfg, subset="raw"))
     cal_answers = sub.assign(vc_post=iso.predict(sub[vc_col].to_numpy(dtype=float)))
     cal = product_rule_divergence(product_rule_curve(cal_answers, cfg,

@@ -116,10 +116,13 @@ def greedy_anchor(lm, cfg: Config, question_row: pd.Series) -> str:
                                  "ds": question_row["dataset"],
                                  "variant": spec.variant, "scale": spec.scale,
                                  "kind": "post"})
-    gen = lm.generate(msgs, temperature=float(cfg.get("anchor.greedy_temperature")),
+    from .backends.base import SamplingParams
+    params = SamplingParams.from_config(
+        cfg, temperature=float(cfg.get("anchor.greedy_temperature")),
+        max_tokens=int(cfg.get("anchor.greedy_max_tokens")))
+    gen = lm.generate(msgs, params=params,
                       seed=derive_seed(int(cfg.get("run.seed")), "anchor",
-                                       question_row["q_id"]),
-                      max_tokens=int(cfg.get("anchor.greedy_max_tokens")))
+                                       question_row["q_id"]))
     from .parsing import parse_answer_and_vc
     return parse_answer_and_vc(gen.text, spec.scale).answer
 

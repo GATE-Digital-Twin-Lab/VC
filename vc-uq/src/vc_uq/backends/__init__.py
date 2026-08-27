@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from ..config import Config
 from .base import (EmbeddingBackend, Generation, LMBackend, NLIBackend,
-                   TokenStats, cosine_distance, entropy_bounds_from_topk,
-                   entropy_from_logits, pairwise_cosine_distance)
+                   SamplingParams, TokenStats, cosine_distance,
+                   entropy_bounds_from_topk, entropy_from_logits,
+                   pairwise_cosine_distance)
 
 __all__ = [
-    "Generation", "TokenStats", "LMBackend", "EmbeddingBackend", "NLIBackend",
+    "Generation", "TokenStats", "SamplingParams", "LMBackend",
+    "EmbeddingBackend", "NLIBackend",
     "cosine_distance", "pairwise_cosine_distance", "entropy_from_logits",
     "entropy_bounds_from_topk", "build_lm", "build_embedder", "build_nli",
 ]

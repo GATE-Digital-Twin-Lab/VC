@@ -33,7 +33,7 @@ been validated against a simulated model with known ground truth.
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 python -m vc_uq smoke      # whole pipeline on the simulated backend, ~1 minute
-pytest -q                  # 68 tests
+pytest -q                  # 84 tests
 ```
 
 `smoke` deliberately runs at `N_MAX = 12`, so it *fails* the KM-flatness and
@@ -52,13 +52,37 @@ results/runs/20260827-094939__smoke/
     processed/             *.parquet
 data/raw/                  SHARED generation cache, keyed by run.name
     smoke__answers.parquet
+    smoke__vc_pre_repeats.parquet
+    smoke__per_position.parquet
 ```
 
 The raw cache is deliberately **not** timestamped. It is the expensive artifact,
 and the whole design rests on downstream phases being pure functions of it
 (§1: *every phase must be re-runnable without re-sampling*). Giving each run its
-own copy would mean re-sampling every time. Re-running generation against an
-existing cache is a no-op on rows already present.
+own copy would mean re-sampling every time.
+
+**Generation is resumable.** Every cache key — including `seed`, which is a hash
+of `(run_seed, q_id, draw_idx, T, prompt_variant)` rather than a counter — is
+computable before a single token is generated. So Phase 1 works out which rows
+are missing, generates only those, and returns their union with the cached ones.
+A job that dies at hour nine of twelve restarts where it stopped, and the table
+it ends up with is the one an uninterrupted run would have produced: no draw's
+content depends on how many draws preceded it in the process.
+
+Two consequences that are easy to get wrong, and are pinned by tests:
+
+- `split` is **not** part of the cache key, so re-splitting does not invalidate
+  expensive generation. Cached rows are re-stamped with the current run's split
+  on read; otherwise a resumed run could mix two split assignments and quietly
+  break calib/eval disjointness.
+- Per-position token entropies live in the raw cache too, not in the run
+  directory. They cost a decode to recreate, and membership in the 10% subsample
+  is hashed per question rather than drawn from an RNG stream — so re-batching
+  or retrying a subset does not re-roll which questions carry diagnostics.
+
+Because the cache key contains `model` (the *name*, not a hash of the weights),
+changing the GGUF file without changing `model.name` will silently mix draws
+from two models. Change the name.
 
 `all`, `smoke` and `generate` open a new run directory; every other command
 attaches to the most recent one for that `run.name`, so a phase-by-phase session
@@ -108,6 +132,16 @@ Set `model.llamacpp.repo_id` / `filename` (or `model_path`) for the GGUF, and
 DeBERTa-MNLI head; `llm` routes entailment through the same GGUF, which is
 weaker and should be reported as such.
 
+**The decoder is specified explicitly, not inherited.** `model.generation`
+carries the full sampling spec and every knob is passed on every call
+(`backends/base.py::SamplingParams`). This matters because backend defaults are
+not neutral — llama.cpp ships `top_k=40, top_p=0.95, min_p=0.05,
+repeat_penalty=1.1`. Passing nothing would sample from a truncated,
+repetition-penalised distribution while the config claimed otherwise, which
+damps the movement in `p_hat` as `T` rises and understates the §8.1 headline.
+A pitfall check fails if the knobs are narrowed, and a test asserts that the
+only thing differing between two temperatures is the temperature.
+
 ## The order things must happen in
 
 `vc_uq all` follows §10, with one deviation. The protocol lists the temperature
@@ -127,6 +161,28 @@ effect being measured.
 re-run with `--labels <path>`. Stratification is across datasets *and* across
 the `e_cos` range: a random sample is almost all easy and says nothing about the
 boundary where `tau` sits.
+
+Three things the loader does deliberately:
+
+- **Only `q_id`, `draw_idx` and `correct_human` are read back.** The sheet is
+  rebuilt from the current scored answers and the labels are merged onto it.
+  `e_cos` is *not* a stable property of a pair — the embedding space is
+  mean-centred over whichever texts were scored together, so adding questions or
+  changing the embedding backend moves it. A stale column would select `tau_star`
+  against numbers that no longer exist and then apply it to numbers that do,
+  without raising.
+- **Rows are shuffled.** Unshuffled, the sheet comes out in stratum order, so
+  labelling the first half would cover the low-`e_cos` bins of the first dataset
+  and nothing else — `tau_star` chosen against nothing but easy pairs, with a
+  flattering kappa because the boundary was never sampled.
+- **Partial labelling is fine; an empty stratum is not.** Unlabelled rows are
+  dropped and coverage is reported per stratum. A stratum with no labelled pair
+  exits **3** and writes the per-stratum table to
+  `tables/phase0_label_coverage.json` so you can see what still needs doing.
+  Overall coverage would hide exactly that hole.
+
+`TRUE/FALSE`, `yes/no`, `1/0` and `y/n` are all accepted. A value that isn't
+recognised is counted and treated as unlabelled rather than guessed at.
 
 The gate is `kappa >= 0.7` AND `AUROC >= 0.85`. Below the AUROC threshold the
 primary criterion flips automatically to NLI bidirectional entailment and cosine
@@ -204,3 +260,10 @@ default config passes, so the checks are not unconditionally pessimistic.
 - Per-position token entropies are stored for a 10% subsample only
   (`generation.token_stats.store_per_position_fraction`); summaries are kept for
   every draw.
+- §8.6(b) — pre-hoc VC on questions with known-recent answers past the training
+  cutoff — is **not implemented**. It needs a dated dataset that does not exist
+  here. 8.6(a) and 8.6(c) are.
+- The §7.1 robustness pass (all questions, `alpha > beta`) runs automatically
+  after the primary restricted-to-`A` table. Where every configured robustness
+  alpha sits at or below `beta`, it is skipped with a note rather than reported
+  as a blank table.

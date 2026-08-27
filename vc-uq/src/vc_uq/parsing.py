@@ -142,6 +142,31 @@ def parse_vc_only(text: str, scale: Scale = "unit") -> Parsed:
     return Parsed(answer="", vc=value, raw=raw, status=status)
 
 
+def parse_audit_from_status(statuses) -> dict[str, float | int]:
+    """Same audit, computed from a stored ``parse_status`` column.
+
+    Needed because a resumed run generates only the rows it is missing, so the
+    audit has to be derived from the whole returned table -- cached rows
+    included -- rather than from the Parsed objects this invocation happened to
+    create. Otherwise the reported failure rate would depend on how much of the
+    job had already been done.
+    """
+    counts: dict[str, int] = {}
+    for s in statuses:
+        if s is None or s != s:      # NaN / pd.NA
+            s = "unknown"
+        counts[str(s)] = counts.get(str(s), 0) + 1
+    n = sum(counts.values())
+    if n == 0:
+        return {"n": 0, "failure_rate": 0.0}
+    failures = n - counts.get(OK, 0)
+    out: dict[str, float | int] = {"n": n, "n_failed": failures,
+                                   "failure_rate": failures / n}
+    for status, c in sorted(counts.items()):
+        out[f"status__{status}"] = c
+    return out
+
+
 def parse_audit(parsed: list[Parsed]) -> dict[str, float | int]:
     """Parse-failure rates, reported alongside every VC result."""
     n = len(parsed)

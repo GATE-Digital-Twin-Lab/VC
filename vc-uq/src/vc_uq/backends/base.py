@@ -61,13 +61,74 @@ class Generation:
     finish_reason: str = "stop"
 
 
+@dataclass(frozen=True)
+class SamplingParams:
+    """The complete decoder specification for one call.
+
+    Bundled rather than passed as loose keyword arguments because the truncation
+    knobs are load-bearing and easy to forget. ``p_q`` is *definitionally* a
+    function of the decoder (protocol 8.1), and the temperature sweep is only a
+    measurement of ``T`` if ``T`` is the only thing that varies. Backend defaults
+    are not neutral -- llama.cpp ships ``top_k=40, top_p=0.95, min_p=0.05,
+    repeat_penalty=1.1`` -- so leaving these unset would silently truncate the
+    tail, damp the effect of raising ``T``, and understate the headline result.
+
+    The defaults here are the unrestricted decoder the protocol requires.
+    """
+
+    temperature: float
+    max_tokens: int = 128
+    top_p: float = 1.0
+    top_k: int = 0            # 0 = disabled
+    min_p: float = 0.0
+    repeat_penalty: float = 1.0
+    stop: tuple[str, ...] = ()
+
+    @classmethod
+    def from_config(cls, cfg, *, temperature: float | None = None,
+                    max_tokens: int | None = None) -> "SamplingParams":
+        gen = cfg.section("model.generation")
+        return cls(
+            temperature=float(temperature if temperature is not None
+                              else cfg.get("generation.temperature")),
+            max_tokens=int(max_tokens if max_tokens is not None
+                           else gen["max_tokens"]),
+            top_p=float(gen["top_p"]), top_k=int(gen["top_k"]),
+            min_p=float(gen["min_p"]),
+            repeat_penalty=float(gen["repeat_penalty"]),
+            stop=tuple(gen.get("stop") or ()),
+        )
+
+    def replace(self, **kw) -> "SamplingParams":
+        from dataclasses import replace as _replace
+        return _replace(self, **kw)
+
+    @property
+    def truncates_tail(self) -> bool:
+        """True if anything other than temperature is shaping the distribution."""
+        return not (self.top_p >= 1.0 and self.top_k <= 0
+                    and self.min_p <= 0.0 and self.repeat_penalty == 1.0)
+
+    def truncation_reason(self) -> str:
+        bad = []
+        if self.top_p < 1.0:
+            bad.append(f"top_p={self.top_p}")
+        if self.top_k > 0:
+            bad.append(f"top_k={self.top_k}")
+        if self.min_p > 0.0:
+            bad.append(f"min_p={self.min_p}")
+        if self.repeat_penalty != 1.0:
+            bad.append(f"repeat_penalty={self.repeat_penalty}")
+        return ", ".join(bad)
+
+
 @runtime_checkable
 class LMBackend(Protocol):
     name: str
     full_vocab_logits: bool
 
-    def generate(self, messages: Sequence[dict], *, temperature: float, seed: int,
-                 max_tokens: int, stop: Sequence[str] | None = None) -> Generation: ...
+    def generate(self, messages: Sequence[dict], *, params: SamplingParams,
+                 seed: int) -> Generation: ...
 
     def teacher_force(self, messages: Sequence[dict], continuation: str) -> TokenStats:
         """Token statistics for ``continuation`` under ``messages``.

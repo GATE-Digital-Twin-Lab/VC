@@ -146,6 +146,19 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
     r.add("lambda_hat is selected on eval, not calib", True, "fatal",
           "run_phase4 certifies on calib traces and scores candidates on eval traces")
 
+    # -- the decoder must be unrestricted --
+    from .backends.base import SamplingParams
+    sp = SamplingParams.from_config(cfg)
+    r.add("decoder is unrestricted, so p_q is a function of T alone",
+          not sp.truncates_tail, "fatal",
+          (f"model.generation sets {sp.truncation_reason()}. p_q is definitionally "
+           "a function of the decoder, so the 8.1 temperature sweep only measures "
+           "T if T is the only thing shaping the distribution. Truncating the tail "
+           "damps the effect of raising T and understates the headline result.")
+          if sp.truncates_tail else
+          "top_p=1, top_k=0, min_p=0, repeat_penalty=1 passed explicitly on every "
+          "call, overriding the backend's own defaults")
+
     # -- product rule accumulated in log space --
     from .clm import RULE_UNITS
     r.add("product rule is accumulated as a sum of logs",

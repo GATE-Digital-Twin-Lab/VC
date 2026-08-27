@@ -56,6 +56,8 @@ def build_label_sheet(cfg: Config, answers: pd.DataFrame,
     sub["e_bin"] = sub.groupby("dataset")["e_cos"].transform(
         lambda s: pd.qcut(s.rank(method="first"), min(n_bins, max(1, s.nunique())),
                           labels=False, duplicates="drop"))
+    sub["stratum"] = (sub["dataset"].astype(str) + "|e"
+                      + sub["e_bin"].astype("Int64").astype(str))
     strata = sub.groupby(["dataset", "e_bin"], dropna=False)
     per_stratum = max(1, n // max(1, strata.ngroups))
     rng = np.random.default_rng(int(cfg.get("run.seed")))
@@ -67,19 +69,180 @@ def build_label_sheet(cfg: Config, answers: pd.DataFrame,
     sheet = pd.concat(picks, ignore_index=True)
     if len(sheet) > n:
         sheet = sheet.sample(n, random_state=int(cfg.get("run.seed")))
+    if bool(cfg.get("phase0.labels.shuffle_sheet")):
+        # The concat above is in stratum order, and it only overflows n (and so
+        # only gets shuffled) by accident. Labelling the first half of an
+        # unshuffled sheet would cover the low-e_cos bins of the first dataset
+        # and nothing else, so tau_star would be selected against pairs that are
+        # all easy -- with a flattering kappa, because the boundary was never
+        # sampled. Shuffling makes partial labelling degrade gracefully.
+        sheet = sheet.sample(frac=1.0, random_state=int(cfg.get("run.seed")))
+    sheet = sheet.reset_index(drop=True)
 
     a_star = questions.set_index("q_id")["a_star"]
     question_text = questions.set_index("q_id")["question"]
     return pd.DataFrame({
-        "q_id": sheet["q_id"].to_numpy(),
-        "draw_idx": sheet["draw_idx"].to_numpy(),
+        "q_id": sheet["q_id"].astype(str).to_numpy(),
+        "draw_idx": sheet["draw_idx"].astype(int).to_numpy(),
         "dataset": sheet["dataset"].to_numpy(),
+        "stratum": sheet["stratum"].to_numpy(),
         "question": sheet["q_id"].map(question_text).to_numpy(),
         "answer": sheet["answer"].to_numpy(),
         "a_star": sheet["q_id"].map(a_star).to_numpy(),
         "e_cos": sheet["e_cos"].to_numpy(),
         "correct_human": pd.Series([pd.NA] * len(sheet), dtype="boolean"),
     })
+
+
+# --------------------------------------------------------------------------
+# Reading hand labels back in
+# --------------------------------------------------------------------------
+
+_TRUE_TOKENS = {"true", "t", "yes", "y", "1", "1.0", "correct"}
+_FALSE_TOKENS = {"false", "f", "no", "n", "0", "0.0", "incorrect"}
+_BLANK_TOKENS = {"", "na", "nan", "none", "<na>", "null", "?"}
+
+
+def _parse_label(value) -> object:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return pd.NA
+    if isinstance(value, float) and np.isnan(value):
+        return pd.NA
+    token = str(value).strip().lower()
+    if token in _BLANK_TOKENS:
+        return pd.NA
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    return pd.NA
+
+
+class LabelCoverageError(ValueError):
+    """The labelled subset does not cover the stratification.
+
+    Carries the coverage ``report`` so the caller can persist the per-stratum
+    table before failing -- being told which strata still need labelling is the
+    whole point of refusing.
+    """
+
+    def __init__(self, message: str, report: dict | None = None):
+        super().__init__(message)
+        self.report = report or {}
+
+
+def load_hand_labels(cfg: Config, sheet: pd.DataFrame,
+                     path) -> tuple[pd.DataFrame, dict]:
+    """Merge a filled-in label CSV onto a FRESHLY BUILT sheet.
+
+    Only ``correct_human`` is taken from the file. Everything else -- ``e_cos``
+    above all -- is recomputed, because ``e_cos`` is not a stable property of a
+    pair: the embedding space is mean-centred over whichever texts were scored
+    together, so adding questions or changing the embedding backend moves it.
+    Trusting a stale column would select ``tau_star`` against numbers that no
+    longer exist, and then apply that threshold to numbers that do. Nothing
+    would raise; every correctness label downstream would simply be wrong.
+
+    Returns the labelled subset and a coverage report. Unlabelled rows are
+    dropped rather than guessed, but a stratum with NO labelled pair is refused:
+    overall coverage would hide exactly that hole, and the whole point of
+    stratifying was to sample the boundary rather than the easy mass.
+    """
+    raw = pd.read_csv(path)
+    missing = {"q_id", "draw_idx", "correct_human"} - set(raw.columns)
+    if missing:
+        raise ValueError(
+            f"{path}: missing column(s) {sorted(missing)}. Fill in the sheet that "
+            "`vc_uq gate` wrote rather than building a CSV by hand.")
+
+    parsed = raw["correct_human"].map(_parse_label)
+    # fillna BEFORE the membership test: the string accessors propagate NA, so
+    # an empty cell would come through as pd.NA, and `pd.NA not in {...}` is
+    # True -- which would report every deliberately blank row as an
+    # unrecognised value on any partially labelled sheet.
+    tokens = (raw["correct_human"].astype("string").str.strip().str.lower()
+              .fillna(""))
+    n_unrecognised = int((parsed.isna() & ~tokens.isin(list(_BLANK_TOKENS))).sum())
+
+    csv = pd.DataFrame({
+        "q_id": raw["q_id"].astype(str),
+        "draw_idx": pd.to_numeric(raw["draw_idx"], errors="coerce").astype("Int64"),
+        "correct_human": parsed,
+    }).dropna(subset=["draw_idx"])
+    csv["draw_idx"] = csv["draw_idx"].astype(int)
+    n_duplicate_keys = int(csv.duplicated(subset=["q_id", "draw_idx"]).sum())
+    csv = csv.drop_duplicates(subset=["q_id", "draw_idx"], keep="last")
+    labelled_csv = csv[csv["correct_human"].notna()]
+
+    base = sheet.drop(columns=["correct_human"]).copy()
+    base["q_id"] = base["q_id"].astype(str)
+    base["draw_idx"] = base["draw_idx"].astype(int)
+    merged = base.merge(labelled_csv, on=["q_id", "draw_idx"], how="left")
+
+    base_keys = set(zip(base["q_id"], base["draw_idx"]))
+    unjoined = [f"{q}#{d}" for q, d in zip(labelled_csv["q_id"], labelled_csv["draw_idx"])
+                if (q, d) not in base_keys]
+
+    per_stratum = (merged.assign(_lab=merged["correct_human"].notna())
+                   .groupby("stratum")
+                   .agg(n_in_sheet=("q_id", "size"), n_labelled=("_lab", "sum"))
+                   .reset_index())
+    per_stratum["coverage"] = per_stratum["n_labelled"] / per_stratum["n_in_sheet"]
+
+    min_per = int(cfg.get("phase0.labels.min_per_stratum"))
+    thin = per_stratum[per_stratum["n_labelled"] < min_per]
+
+    out = merged[merged["correct_human"].notna()].copy()
+    out["correct_human"] = out["correct_human"].astype(bool)
+    out["label_source"] = "human"
+
+    coverage = float(len(out) / len(base)) if len(base) else 0.0
+    report = {
+        "path": str(path),
+        "n_sheet_rows": int(len(base)),
+        "n_csv_rows": int(len(raw)),
+        "n_labelled_in_csv": int(len(labelled_csv)),
+        "n_joined": int(len(out)),
+        "n_unjoined": len(unjoined),
+        "unjoined_examples": unjoined[:10],
+        "n_unrecognised_values": n_unrecognised,
+        "n_duplicate_keys": n_duplicate_keys,
+        "coverage": coverage,
+        "min_coverage": float(cfg.get("phase0.labels.min_coverage")),
+        "coverage_ok": coverage >= float(cfg.get("phase0.labels.min_coverage")),
+        "n_strata": int(len(per_stratum)),
+        "n_strata_below_min": int(len(thin)),
+        "per_stratum": per_stratum.to_dict("records"),
+        "warnings": [],
+    }
+    if unjoined:
+        report["warnings"].append(
+            f"{len(unjoined)} labelled CSV rows matched no pair in the current sheet. "
+            "The split assignment or the sampled strata have moved since the sheet "
+            "was written (run.seed, dataset sizes, or stratify_bins).")
+    if n_unrecognised:
+        report["warnings"].append(
+            f"{n_unrecognised} correct_human values were not recognised as "
+            "true/false and were treated as unlabelled.")
+    if not report["coverage_ok"]:
+        report["warnings"].append(
+            f"only {coverage:.0%} of the sheet is labelled "
+            f"(below phase0.labels.min_coverage).")
+
+    if len(thin):
+        raise LabelCoverageError(
+            f"{len(thin)} of {len(per_stratum)} strata have fewer than {min_per} "
+            f"labelled pair(s): {list(thin['stratum'])[:8]}. tau_star would be "
+            "selected against an unrepresentative slice of the e_cos range, which "
+            "is the failure the stratification exists to prevent. Label at least "
+            "one pair in each stratum, or lower phase0.labels.min_per_stratum "
+            "deliberately. The full per-stratum table is in "
+            "tables/phase0_label_coverage.json.",
+            report=report)
+
+    return out, report
 
 
 def simulate_human_labels(sheet: pd.DataFrame, answers: pd.DataFrame,

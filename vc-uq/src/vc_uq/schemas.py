@@ -40,6 +40,9 @@ ANSWERS_SCHEMA: dict[str, tuple[str, bool]] = {
     "correct_cos": ("boolean", True),
     "correct_nli": ("boolean", True),
     "correct_human": ("boolean", True),    # Phase 0 subset only
+    # Declared, not incidental: the parse-failure rate is reported alongside
+    # every VC result, so it has to survive a round trip through the cache.
+    "parse_status": ("string", True),
 }
 
 QUESTIONS_SCHEMA: dict[str, tuple[str, bool]] = {
@@ -76,6 +79,23 @@ VC_PRE_REPEATS_SCHEMA: dict[str, tuple[str, bool]] = {
     "prompt_variant": ("string", False),
     "seed": ("Int64", False),
     "model": ("string", False),
+    "parse_status": ("string", True),
+}
+
+# Per-position token diagnostics, kept for a subsample of draws. This is
+# generation output -- recreating it means decoding again -- so it belongs in
+# the shared raw cache next to the answers, not in a per-run results directory
+# where a crash would lose it. Keyed identically to the answer it describes.
+PER_POSITION_SCHEMA: dict[str, tuple[str, bool]] = {
+    "q_id": ("string", False),
+    "dataset": ("string", False),
+    "draw_idx": ("int32", False),
+    "temperature": ("Float64", False),
+    "prompt_variant": ("string", False),
+    "seed": ("Int64", False),
+    "model": ("string", False),
+    "entropies": ("object", True),
+    "chosen_probs": ("object", True),
 }
 
 # Generation cache key (protocol section 1). Uniqueness is enforced on write.

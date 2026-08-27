@@ -34,9 +34,9 @@ import pandas as pd
 import yaml
 
 from .config import Config
-from .schemas import (ANSWER_KEY, ANSWERS_SCHEMA, QUESTIONS_SCHEMA,
-                      VC_PRE_KEY, VC_PRE_REPEATS_SCHEMA, check_unique_key,
-                      conform)
+from .schemas import (ANSWER_KEY, ANSWERS_SCHEMA, PER_POSITION_SCHEMA,
+                      QUESTIONS_SCHEMA, VC_PRE_KEY, VC_PRE_REPEATS_SCHEMA,
+                      check_unique_key, conform, empty_frame)
 
 MANIFEST_NAME = "manifest.json"
 CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
@@ -257,14 +257,67 @@ class Store:
     def append_vc_pre_repeats(self, df: pd.DataFrame) -> pd.DataFrame:
         return self.append_raw("vc_pre_repeats", df, VC_PRE_REPEATS_SCHEMA, VC_PRE_KEY)
 
-    def missing_answer_keys(self, wanted: pd.DataFrame) -> pd.DataFrame:
+    def append_per_position(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.append_raw("per_position", df, PER_POSITION_SCHEMA, ANSWER_KEY)
+
+    # -- resume: what is already in the cache ------------------------------
+    # Generation is the only expensive step, so a run that dies at hour nine of
+    # twelve must not start over. Every cache key is derivable WITHOUT calling
+    # the model -- `seed` comes from a hash of (run_seed, q_id, draw_idx, T,
+    # variant) -- so the set of missing rows is computable up front.
+
+    @staticmethod
+    def _align_keys(wanted: pd.DataFrame, schema, key) -> pd.DataFrame:
+        """Cast the key columns to the declared dtypes before joining on them.
+
+        The key is a mixed tuple: a float (``temperature``), a nullable Int64
+        (``seed``), strings. A float64 column does not join cleanly against a
+        Float64 one, and a silent non-match here is indistinguishable from a
+        cold cache -- it would quietly re-generate everything, which is the one
+        failure this path exists to prevent. So both sides are cast, always.
+        """
+        out = wanted.copy()
+        for col in key:
+            out[col] = out[col].astype(schema[col][0])
+        return out
+
+    def missing_keys(self, table: str, wanted: pd.DataFrame, schema,
+                     key: tuple[str, ...]) -> pd.DataFrame:
         """Rows of ``wanted`` (a key-only frame) that are not yet cached."""
-        path = self.raw_path("answers")
+        wanted = self._align_keys(wanted, schema, key)
+        path = self.raw_path(table)
         if not path.exists():
-            return wanted
-        have = pd.read_parquet(path, columns=list(ANSWER_KEY))
-        merged = wanted.merge(have, on=list(ANSWER_KEY), how="left", indicator=True)
-        return merged.loc[merged["_merge"] == "left_only", list(wanted.columns)]
+            return wanted.reset_index(drop=True)
+        have = self._align_keys(pd.read_parquet(path, columns=list(key)),
+                                schema, key)
+        merged = wanted.merge(have.drop_duplicates(), on=list(key), how="left",
+                              indicator=True)
+        return (merged.loc[merged["_merge"] == "left_only", list(wanted.columns)]
+                .reset_index(drop=True))
+
+    def cached_rows(self, table: str, wanted: pd.DataFrame, schema,
+                    key: tuple[str, ...]) -> pd.DataFrame:
+        """The cached rows matching ``wanted``, conformed to ``schema``."""
+        path = self.raw_path(table)
+        if not path.exists():
+            return empty_frame(schema)
+        have = conform(pd.read_parquet(path), schema, name=table)
+        w = self._align_keys(wanted[list(key)].drop_duplicates(), schema, key)
+        return have.merge(w, on=list(key), how="inner").reset_index(drop=True)
+
+    def missing_answer_keys(self, wanted: pd.DataFrame) -> pd.DataFrame:
+        return self.missing_keys("answers", wanted, ANSWERS_SCHEMA, ANSWER_KEY)
+
+    def missing_vc_pre_keys(self, wanted: pd.DataFrame) -> pd.DataFrame:
+        return self.missing_keys("vc_pre_repeats", wanted, VC_PRE_REPEATS_SCHEMA,
+                                 VC_PRE_KEY)
+
+    def cached_answers(self, wanted: pd.DataFrame) -> pd.DataFrame:
+        return self.cached_rows("answers", wanted, ANSWERS_SCHEMA, ANSWER_KEY)
+
+    def cached_vc_pre_repeats(self, wanted: pd.DataFrame) -> pd.DataFrame:
+        return self.cached_rows("vc_pre_repeats", wanted, VC_PRE_REPEATS_SCHEMA,
+                                VC_PRE_KEY)
 
     # -- reads -------------------------------------------------------------
     def read_answers(self, *, splits: list[str] | None = None,
