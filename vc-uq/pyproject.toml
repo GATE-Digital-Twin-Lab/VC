@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vc-uq"
+version = "0.1.0"
+description = "Verbalised confidence as an uncertainty estimator"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "pyyaml>=6",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# Generation machine only. Analysis phases are pure functions of the cache and
+# need none of this.
+llamacpp = ["llama-cpp-python>=0.3.0", "huggingface-hub>=0.23"]
+nli = ["torch>=2.1", "transformers>=4.40", "sentencepiece"]
+data = ["datasets>=2.19"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+vc-uq = "vc_uq.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

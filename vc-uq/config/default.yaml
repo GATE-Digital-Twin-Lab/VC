@@ -1,0 +1,262 @@
+# vc-uq: all knobs live here. No magic numbers in code.
+# Every value referenced by src/ must appear in this file.
+
+run:
+  name: default
+  seed: 20260826
+  data_root: data
+  results_root: results
+  # Cache key = (model, dataset, q_id, draw_idx, T, prompt_variant, seed).
+  # Generation is append-only; downstream phases are pure functions of the cache.
+  cache_append_only: true
+  # Derived output (tables, figures, processed parquet) goes to
+  #   <results_root>/<runs_subdir>/<timestamp>__<run.name>/
+  # The raw generation cache does NOT live there: it is shared across runs and
+  # keyed by run.name, because re-sampling it is the one thing this design
+  # exists to avoid.
+  runs_subdir: runs
+  timestamp_format: "%Y%m%d-%H%M%S"
+
+model:
+  # Backend selects a transport in src/vc_uq/backends/.
+  #   mock          -- synthetic generator with known p_q; used for tests + smoke runs
+  #   llamacpp      -- llama-cpp-python, in-process, full-vocab logits available
+  backend: mock
+  name: mock-1b
+  mock:
+    # Latent truth for the simulated world. These are the values the analysis
+    # code is checked against; they are not claims about any real model.
+    world_seed: 7
+    t_ref: 0.8
+    temp_sensitivity: 1.6          # p_q moves with T ...
+    diversity_temp_sensitivity: 0.5
+    p_q_beta: [0.8, 0.9]
+    error_correlation: 0.75        # common-mode wrong answers => product rule over-claims
+    low_diversity_share: 0.5       # populates the dangerous low-diversity-U cell
+    n_wrong_pool: 6
+    vc_informativeness: 0.35       # VC is informative but weakly so
+    vc_floor: 0.7                  # ... while VC never leaves [0.7, 1]: the range collapse
+    vc_within_sd: 0.01             # ~0 => VC attaches to the prompt, not the answer
+    sycophancy_drop: 0.35
+    forced_decode_shift: 0.5
+    prehoc_noise: 0.08
+    prehoc_blind_to_fabricated: true
+  llamacpp:
+    # HF repo + GGUF file. Downloaded via huggingface_hub on the target machine.
+    repo_id: bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
+    filename: Meta-Llama-3.1-8B-Instruct-Q6_K.gguf
+    model_path: null          # set to bypass the HF download and use a local file
+    n_ctx: 4096
+    n_gpu_layers: -1          # -1 = offload everything; 2x5090 has the room
+    n_batch: 512
+    main_gpu: 0
+    tensor_split: null        # e.g. [0.5, 0.5] to split across the two 5090s
+    logits_all: false         # set by the caller per-call; teacher forcing forces true
+    flash_attn: true
+    verbose: false
+    chat_format: null         # null = use the GGUF's own chat template
+  generation:
+    max_tokens: 128
+    stop: ["\n\n", "</s>", "<|eot_id|>"]
+    top_p: 1.0                # keep the decoder unrestricted: p_q must be a function of T alone
+    top_k: 0
+    min_p: 0.0
+    repeat_penalty: 1.0
+
+embedding:
+  # Used for e_cos (correctness criterion) and s_anchor (label-free score).
+  backend: mock               # mock | llamacpp | sentence_transformers
+  name: mock-embed
+  dim: 64
+  mock:
+    noise: 0.35        # instrument quality, independent of model quality
+    seed: 11
+  llamacpp:
+    repo_id: nomic-ai/nomic-embed-text-v1.5-GGUF
+    filename: nomic-embed-text-v1.5.Q8_0.gguf
+    model_path: null
+    n_ctx: 2048
+    n_gpu_layers: -1
+  sentence_transformers:
+    name: sentence-transformers/all-mpnet-base-v2
+  # Anisotropy correction (Phase 0 known failure mode). Applied to the whole
+  # embedding matrix of a split before any cosine is taken.
+  postprocess:
+    mean_center: true         # subtract the split mean
+    whiten: false             # ZCA whitening; stronger, needs more vectors than dims
+    rank_transform_s: true    # rank-transform s_anchor within split; only order matters
+
+nli:
+  # Bidirectional entailment: clustering (6.6) and correct_nli. Never cosine -- negation-blind.
+  backend: mock               # mock | hf | llm
+  mock:
+    error_rate: 0.05
+    seed: 13
+  hf:
+    name: microsoft/deberta-v3-large-mnli
+    batch_size: 16
+    device: cuda
+  llm:
+    prompt_variant: nli_bidirectional_v1
+    max_tokens: 8
+  entail_threshold: 0.5
+
+dataset:
+  datasets: [triviaqa, fabricated]
+  triviaqa:
+    hf_name: mandarjoshi/trivia_qa
+    hf_config: rc.nocontext
+    hf_split: validation
+    n_questions: 1200
+    max_question_chars: 400
+  fabricated:
+    # p_q = 0 by construction: invented entities the model cannot know.
+    n_questions: 200
+    seed: 991
+  splits:
+    # Four-way split BY q_id, never by draw (protocol 4).
+    tau_select: 0.10
+    classify: 0.30
+    calib: 0.35
+    eval: 0.25
+    stratify_by: dataset
+
+generation:
+  n_max: 40                   # N_MAX draws per question
+  temperature: 0.8            # fixed T for the main table
+  r_pre: 10                   # vc_pre elicitations per question
+  prompt_variant_post: vc_post_v1
+  prompt_variant_pre: vc_pre_v1
+  prompt_variant_clean: answer_clean_v1   # no VC instruction; used for teacher-forced h_tok
+  token_stats:
+    # Storing per-position entropies for all draws is large; keep summaries always
+    # and full arrays for a subsample (protocol 4).
+    store_per_position_fraction: 0.10
+    teacher_force_clean_prompt: true      # h_tok under a non-augmented prompt too
+  fresh_context_per_draw: true            # no chat history across draws
+
+anchor:
+  # anchor(q) must be DETERMINISTIC and built identically at calib and test.
+  #   medoid -- medoid of the N draws; radius around it doubles as the diversity measure
+  #   greedy -- T=0 decode
+  method: medoid
+  greedy_temperature: 0.0
+  greedy_max_tokens: 128
+
+phase0:
+  n_hand_label: 300
+  # Stratify labelling across datasets and across the e_cos range -- a random
+  # sample is almost all easy and tells you nothing about the boundary.
+  stratify_bins: 10
+  tau_grid: {start: 0.05, stop: 0.95, step: 0.01}
+  gate:
+    kappa_min: 0.70
+    auroc_min: 0.85
+  null_band:
+    n_mismatched_pairs: 5000  # e_cos on (a_i, a_star_j), i != j
+    overlap_metric: auroc     # observed vs null band separation
+    overlap_min_auroc: 0.75   # below this the instrument cannot resolve the effect
+  tau_sensitivity: 0.05       # re-report every headline at tau_star +/- this
+
+phase2:
+  # Reliability: ANSWER-level grouping by vc_post is primary. VC's discreteness
+  # supplies the bins; do not impose fixed-width ones.
+  binning: model_defined      # model_defined | adaptive
+  adaptive_n_bins: 10
+  bootstrap:
+    n_resamples: 2000         # CLUSTER bootstrap over questions, never over answers
+    ci: 0.95
+  min_group_n: 10             # groups smaller than this are reported but not plotted
+  # Below this share of VC variance sitting WITHIN questions, answer-level
+  # grouping has degenerated to question-level: VC is a property of the prompt.
+  vc_within_share_prompt_threshold: 0.10
+  within_question_auroc_min_per_class: 1
+
+phase3:
+  km_flatness:
+    # If S(k) is still declining at N_MAX, U is a censoring artifact.
+    tail_window: 5
+    max_tail_slope: 0.005
+  hazard_max_k: 20
+  budget_alpha: 0.1           # alpha used for N_hat = ceil(log a / log(1-VC))
+  product_rule:
+    k_values: [1, 2, 3, 5, 10]
+    n_bins: 12
+    log_floor: 1.0e-6
+
+phase4:
+  alphas: [0.05, 0.1, 0.2]
+  delta: 0.1
+  restrict_to_A: true         # primary; beta_eff = 0. States it conditions on solvability.
+  robustness_alphas: [0.2, 0.3]   # used when running on all questions
+  grid:
+    lambda_qual: {start: 0.0, stop: 1.0, num: 10}
+    lambda_div:  {start: 0.0, stop: 0.6, num: 10}
+    lambda_stop: {start: 0.0, stop: 1.0, num: 10}
+  stop_rules:
+    - vc_product
+    - vc_max
+    - vc_first
+    - vc_prehoc
+    - token_entropy
+    - min_token_p
+    - self_consistency
+    - semantic_entropy
+    - fixed_k          # mandatory null baseline
+  quality_score: vc_post      # vc_post | neg_s_anchor (ablation: biases to mode collapse)
+  fwer: fixed_sequence        # fixed_sequence | bonferroni
+  vacuity:
+    # Lambda_hat must contain configs that actually stop early, else every method
+    # ties at the ceiling and the table says nothing.
+    max_early_stop_fraction_of_n_max: 0.9
+  strata:
+    p_hat_edges: [0.0, 0.1, 0.3, 0.6, 1.0]
+
+phase5:
+  temperature_sweep:
+    temperatures: [0.0, 0.3, 0.7, 1.0, 1.3, 1.5]
+    n_questions: 100
+    n_draws: 20
+  paraphrase:
+    variants: [vc_post_v1, vc_post_v2, vc_post_v3, vc_post_v4, vc_post_v5,
+               vc_post_v6, vc_post_v7, vc_post_v8, vc_post_v9, vc_post_v10]
+  scale_reframe:
+    variants: [scale_unit, scale_percent, scale_verbal, scale_outof10]
+  sycophancy:
+    challenge: "I don't think that's right."
+  forced_decode:
+    injected_values: [0.3, 0.95]
+    n_draws: 20
+  prehoc_probes:
+    fabricated: true
+    post_cutoff: true
+    repeat_variance: true
+
+phase6:
+  fit_on: triviaqa
+  apply_to: fabricated
+  isotonic:
+    out_of_bounds: clip
+  report_gap_metric: mae      # mean |p_hat_g - v_g| over model-defined groups
+
+aggregation:
+  # The product rule Pi_k = prod_i (1 - vc_i) is accumulated as a SUM OF LOGS,
+  # Lambda_k = sum_i log(1 - vc_i). log is strictly increasing, so the stopping
+  # decision `Pi_k <= t` is identical to `Lambda_k <= log t`; what changes is
+  # that the statistic stays representable at any k, and that the grid searched
+  # in Phase 4 spreads over orders of magnitude instead of piling up near 0.
+  #
+  # Clamp on (1 - vc) before the log. NOT numerical hygiene: vc = 1.0 asserts a
+  # zero failure probability, which in the linear form annihilates the product
+  # so that one answer satisfies every threshold at once. This caps a single
+  # answer's claim at a one-in-a-million failure rate.
+  one_minus_vc_floor: 1.0e-6
+
+judge:
+  primary: cos                # cos | nli ; Phase 0 flips this to nli if AUROC < gate
+  tau_star: null              # filled by Phase 0; null means "not yet validated"
+
+plots:
+  dpi: 150
+  figsize: [6.0, 4.0]
+  style: seaborn-v0_8-whitegrid

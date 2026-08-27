@@ -50,8 +50,10 @@ model's per-sample correctness probability. The thesis is *not* "VC is uninforma
 | `alpha` | float | Target risk. **An input — hitting it validates nothing** |
 | `delta` | float | LTT confidence: `P(R(lambda_hat) <= alpha) >= 1 - delta` |
 | `lambda` | tuple | CLM config `(lambda_qual, lambda_div, lambda_stop)` |
-| `Pi_k` | [0,1] | `prod_{i<=k} (1 - VC(q,a_i))` over *diverse retained* answers |
-| `c_discount` | float | `alpha / lambda_stop_hat` — the discount factor on VC's claims |
+| `Lambda_k` | (-inf,0] | `sum_{i<=k} log(1 - VC(q,a_i))` over *diverse retained* answers. **The product rule, accumulated in log space** |
+| `Pi_k` | [0,1] | `exp(Lambda_k)` — the same claim as a probability. Reporting/plotting only; never accumulated directly |
+| `eps_vc` | float | Floor on `1 - VC` before the log. Default `1e-6` |
+| `c_discount` | float | `alpha / exp(lambda_stop_hat)` — the discount factor on VC's claims |
 
 **Critical distinction — `s` and `e` are different functions and must not be merged.**
 
@@ -359,18 +361,47 @@ consistent, confident, wrong. If so, VC is anti-correlated with correctness exac
 stakes are highest.
 
 ### 6.7 Product-rule reliability
-Bin questions by `Pi_k = prod(1 - vc_post_i)` over diverse retained answers; plot observed
-frequency of "all k wrong" against `Pi_k`, log-log, one curve per k. **Run separately on
-`U` and `A`.**
+**Accumulate the product rule as a sum of logs.** The statistic is
+`Lambda_k = sum_{i<=k} log(1 - vc_post_i)` over diverse retained answers, never
+`prod(1 - vc_post_i)`. Three reasons, only the first of which is cosmetic:
+
+1. The claim decays geometrically. At `vc = 0.99` the linear product underflows float64
+   by around `k = 160`, and every question past that becomes an indistinguishable `0.0`.
+2. That collapse silently merges the grid quantiles Phase 4 searches over (7.4), so the
+   thresholds actually tested depend on where the floating-point floor happens to fall.
+3. `vc = 1.0` is **in the observed support** and asserts a failure probability of zero.
+   In the linear form one such answer annihilates the product and satisfies every
+   threshold at once, so the rule degenerates to "stop as soon as any answer says 1.0."
+   Clamp `1 - vc` at `eps_vc` before the log; a single answer's claim is then capped at
+   `log(eps_vc)` rather than being unbounded. **`eps_vc` is a declared parameter, not a
+   hidden epsilon** — it sets exactly how strong a claim one answer may make, and
+   headline results should be re-reported across at least one order of magnitude of it.
+
+Since `log` is strictly increasing, `Pi_k <= t` and `Lambda_k <= log t` cut the sample
+space identically: the decision boundary is unchanged and the monotonicity in
+`lambda_stop` that licenses fixed-sequence testing (7.4) is preserved. Only the
+representation changes.
+
+Bin questions by `Lambda_k`; plot observed frequency of "all k wrong" against
+`exp(Lambda_k)`, log-log, one curve per k. **Run separately on `U` and `A`.** Bin on
+`Lambda_k` rather than on the exponentiated value — the ordering is the same, but the
+linear form produces a wall of exact zeros at large `k` that would collapse the low bins
+into one group.
 
 - Honest aggregation ⇒ curves on the diagonal.
 - Common-mode errors ⇒ curves flatten, **and the gap widens with k**.
 
 The divergence-in-`k` is the signature: a single VC of 0.8 on a wrong answer is off by ~5x
-in failure probability; after five draws the claim is `0.2^5 = 3.2e-4` against a truth of
-1, off by ~3000x. Sampling makes the estimate monotonically *worse*. Recalibration does not
-repair this — an isotonic map is monotone and pointwise, so it shrinks the values but
-preserves the compounding structure, and the gap still diverges in `k`.
+in failure probability; after five draws the claim is `exp(5 log 0.2) = 3.2e-4` against a
+truth of 1, off by ~3000x. Sampling makes the estimate monotonically *worse*. Recalibration
+does not repair this — an isotonic map is monotone and pointwise, so it shrinks the values
+but preserves the compounding structure, and the gap still diverges in `k`.
+
+**Report the gap as `log10(observed) - Lambda_k/log(10)`, not as a ratio.** In log space the
+signature is a straight line in `k` with a positive slope, which is both easier to read and
+easier to test than a ratio that reaches `1e5` by `k = 10` and overflows entirely beyond it.
+The slope of that line is the quantity to quote: it is the rate at which each additional
+sample makes the claim worse. A slope indistinguishable from zero is the falsifying result.
 
 Report the empirical floor where curves plateau: the achievable failure rate regardless of
 what the product claims.
@@ -406,7 +437,7 @@ succeeded." Baselines fail identically and the compute is wasted.
 
 | Variant | Stop when |
 |---|---|
-| `vc_product` | `prod_{i<=k}(1 - vc_post_i) <= lambda_stop` over diverse retained answers |
+| `vc_product` | `Lambda_k = sum_{i<=k} log(1 - vc_post_i) <= lambda_stop` over diverse retained answers. **`lambda_stop` is in log-probability (nats) for this rule** |
 | `vc_max` | `max_{i<=k} vc_post_i >= lambda_stop` |
 | `vc_first` | `vc_1 >= lambda_stop` — budget fixed after one draw; cannot adapt |
 | `vc_prehoc` | `vc_pre >= lambda_stop` — budget fixed **before any draw**; the purest test of prospective VC |
@@ -463,17 +494,17 @@ Select `lambda_hat = argmin E_q[draws]` over `Lambda_hat`, **on `eval`, never on
 
 For `alpha in {0.05, 0.1, 0.2}`, `delta = 0.1`:
 
-| stop score | `E[draws]` | `E[|C(q)|]` | realized risk | `lambda_stop_hat` | `c_discount` |
-|---|---|---|---|---|---|
-| vc_product | | | | | |
-| vc_max | | | | | |
-| vc_first | | | | | |
-| vc_prehoc | | | | | |
-| token_entropy | | | | | |
-| min_token_p | | | | | |
-| self_consistency | | | | | |
-| semantic_entropy | | | | | |
-| fixed_k | | | | | |
+| stop score | `E[draws]` | `E[|C(q)|]` | realized risk | `lambda_stop_hat` | units | `c_discount` |
+|---|---|---|---|---|---|---|
+| vc_product | | | | | | |
+| vc_max | | | | | | |
+| vc_first | | | | | | |
+| vc_prehoc | | | | | | |
+| token_entropy | | | | | | |
+| min_token_p | | | | | | |
+| self_consistency | | | | | | |
+| semantic_entropy | | | | | | |
+| fixed_k | | | | | | |
 
 **Risk is held constant by construction; efficiency is the free variable.** That is what
 makes the comparison meaningful — same guarantee, different price.
@@ -486,8 +517,15 @@ Three outcomes, all publishable:
 - VC competitive ⇒ report honestly; Phase 5 still carries the thesis.
 
 ### 7.6 The discount factor
-`c_discount = alpha / lambda_stop_hat` for `vc_product`. If VC were truthful,
-`lambda_stop_hat = alpha` and `c_discount = 1`. Empirically expect `>> 1`: the model's
+`c_discount = alpha / exp(lambda_stop_hat)` for `vc_product`. **`lambda_stop_hat` is a
+log-probability, so it must be exponentiated before dividing** — `alpha` divided by a
+threshold in nats is a units error that still yields a plausible-looking number. Form the
+quotient in log space and exponentiate once: `log c_discount = log(alpha) - lambda_stop_hat`.
+Quote `log10(c_discount)` as the primary figure; the linear form overflows when the
+certified threshold sits far below `alpha`, which is precisely the regime being measured.
+
+If VC were truthful, `exp(lambda_stop_hat) = alpha` and `c_discount = 1`. Empirically
+expect `>> 1`: the model's
 self-reported failure probability must reach `alpha / c` before 1-alpha coverage is
 actually achieved.
 
@@ -576,6 +614,11 @@ non-invariance are already a contribution.
 - [ ] Same draws used to classify `A` and to calibrate (voids guarantee)
 - [ ] `tau` selected and LTT run on the same split (voids guarantee)
 - [ ] `lambda_hat` selected on `calib` rather than `eval`
+- [ ] Product rule accumulated as a running product rather than `sum log(1 - vc)`
+      (underflows at large `k`; collapses the Phase 4 grid quantiles)
+- [ ] `vc = 1.0` left unclamped, so one answer zeroes `Pi_k` and satisfies every threshold
+- [ ] `c_discount` computed as `alpha / lambda_stop_hat` without exponentiating the
+      log-space threshold (units error; the number still looks plausible)
 - [ ] Plain Hoeffding used where `R_hat ~ 0` (Bentkus needed)
 - [ ] No FWER correction over the `lambda` grid
 - [ ] Cosine used for clustering (negation-blind)
