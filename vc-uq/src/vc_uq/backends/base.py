@@ -9,14 +9,16 @@ served by different models:
 
 The token-statistics contract is the demanding one. ``h_tok`` is defined over
 the FULL next-token distribution (protocol section 0), which rules out any
-transport that returns only a truncated top-k. Where a backend can only supply
-top-k it must say so via ``full_vocab_logits = False`` so the analysis can label
-the column as an estimate rather than the quantity in the spec.
+transport that returns only a truncated top-k. That is why generation runs
+``llama-cpp-python`` in process rather than against a server: an HTTP API
+returns top-k logprobs, and top-k entropy is a different quantity from the one
+in the spec. Any backend added here must be able to supply the full
+distribution; there is no degraded mode.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
 import numpy as np
@@ -29,7 +31,6 @@ class TokenStats:
     entropies: np.ndarray        # [n_tokens] entropy of the full next-token distribution
     logprobs: np.ndarray         # [n_tokens] log p of the chosen token
     chosen_probs: np.ndarray     # [n_tokens] p of the chosen token
-    full_vocab: bool = True      # False => entropies are truncated-top-k estimates
 
     def __post_init__(self) -> None:
         n = len(self.entropies)
@@ -40,16 +41,17 @@ class TokenStats:
     def n_tokens(self) -> int:
         return int(len(self.entropies))
 
-    def summary(self, prefix: str = "") -> dict[str, float | int | None]:
+    def summary(self) -> dict[str, float | int | None]:
         if self.n_tokens == 0:
-            keys = ["h_tok_mean", "h_tok_max", "logp_mean", "min_token_p", "n_tokens"]
-            return {f"{prefix}{k}": None for k in keys}
+            # Missing data, not zero entropy.
+            return {k: None for k in ("h_tok_mean", "h_tok_max", "logp_mean",
+                                      "min_token_p", "n_tokens")}
         return {
-            f"{prefix}h_tok_mean": float(np.mean(self.entropies)),
-            f"{prefix}h_tok_max": float(np.max(self.entropies)),
-            f"{prefix}logp_mean": float(np.mean(self.logprobs)),
-            f"{prefix}min_token_p": float(np.min(self.chosen_probs)),
-            f"{prefix}n_tokens": int(self.n_tokens),
+            "h_tok_mean": float(np.mean(self.entropies)),
+            "h_tok_max": float(np.max(self.entropies)),
+            "logp_mean": float(np.mean(self.logprobs)),
+            "min_token_p": float(np.min(self.chosen_probs)),
+            "n_tokens": int(self.n_tokens),
         }
 
 
@@ -57,7 +59,6 @@ class TokenStats:
 class Generation:
     text: str
     stats: TokenStats
-    token_ids: list[int] = field(default_factory=list)
     finish_reason: str = "stop"
 
 
@@ -125,7 +126,6 @@ class SamplingParams:
 @runtime_checkable
 class LMBackend(Protocol):
     name: str
-    full_vocab_logits: bool
 
     def generate(self, messages: Sequence[dict], *, params: SamplingParams,
                  seed: int) -> Generation: ...
@@ -182,22 +182,3 @@ def entropy_from_logits(logits: np.ndarray) -> float:
     p /= p.sum()
     nz = p > 0
     return float(-np.sum(p[nz] * np.log(p[nz])))
-
-
-def entropy_bounds_from_topk(probs: Sequence[float], vocab_size: int) -> tuple[float, float]:
-    """Entropy bounds when only the top-k probabilities are observable.
-
-    Lower bound puts all residual mass on a single unseen token; upper bound
-    spreads it uniformly over the remaining vocabulary. Reported as an interval
-    so a truncated transport never masquerades as a full-vocab measurement.
-    """
-    p = np.asarray(list(probs), dtype=np.float64)
-    p = p[p > 0]
-    head = float(-np.sum(p * np.log(p)))
-    rest = max(0.0, 1.0 - float(p.sum()))
-    n_rest = max(1, vocab_size - len(p))
-    if rest <= 0:
-        return head, head
-    lower = head - rest * np.log(rest)
-    upper = head - rest * np.log(rest / n_rest)
-    return float(lower), float(upper)

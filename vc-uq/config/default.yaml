@@ -37,10 +37,8 @@ model:
     vc_informativeness: 0.35       # VC is informative but weakly so
     vc_floor: 0.7                  # ... while VC never leaves [0.7, 1]: the range collapse
     vc_within_sd: 0.01             # ~0 => VC attaches to the prompt, not the answer
-    sycophancy_drop: 0.35
-    forced_decode_shift: 0.5
-    prehoc_noise: 0.08
-    prehoc_blind_to_fabricated: true
+    prehoc_noise: 0.08             # vc_pre wobble from one repeat to the next
+    prehoc_blind_to_fabricated: true   # vc_pre does not drop on invented entities
   llamacpp:
     # HF repo + GGUF file. Downloaded via huggingface_hub on the target machine.
     repo_id: bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
@@ -120,12 +118,20 @@ dataset:
     n_questions: 200
     seed: 991
   splits:
-    # Four-way split BY q_id, never by draw (protocol 4).
+    # Four-way split BY q_id, never by draw (protocol 4). Assignment is a hash
+    # of q_id so it is stable when questions are added later; the cost is that
+    # sizes are binomial around these targets rather than exact quotas, and
+    # stratify_by salts the hash per group rather than dealing out quotas within
+    # it. A pitfall check reports the realised shares.
     tau_select: 0.10
     classify: 0.30
     calib: 0.35
     eval: 0.25
     stratify_by: dataset
+    # Absolute share deviation past which the imbalance is worth a sentence in
+    # the writeup. At n = 1200 the hash lands within ~0.01; at n = 200 it can be
+    # off by 0.07, which is 14 of 70 calibration questions.
+    max_share_deviation: 0.04
 
 generation:
   n_max: 40                   # N_MAX draws per question
@@ -244,18 +250,10 @@ phase5:
   paraphrase:
     variants: [vc_post_v1, vc_post_v2, vc_post_v3, vc_post_v4, vc_post_v5,
                vc_post_v6, vc_post_v7, vc_post_v8, vc_post_v9, vc_post_v10]
-  scale_reframe:
-    variants: [scale_unit, scale_percent, scale_verbal, scale_outof10]
-  sycophancy:
-    challenge: "I don't think that's right."
-  forced_decode:
-    injected_values: [0.3, 0.95]
-    n_draws: 20
-  prehoc_probes:
-    fabricated: true          # 8.6(a) invented entities: p_q = 0 by construction
-    repeat_variance: true     # 8.6(c) is the feeling of knowing stable across repeats?
-    # 8.6(b), questions with known-recent answers past the cutoff, needs a
-    # dataset that does not exist here yet; deliberately not listed as a toggle.
+  # Scale reframing, the sycophancy probe, the forced-decode intervention and
+  # the pre-hoc metacognition probes are out of scope (protocol 8). Each varied
+  # more than one thing at a time and needed its own control arm; the invariance
+  # claim rests on the two matched comparisons above.
 
 phase6:
   fit_on: triviaqa

@@ -84,10 +84,7 @@ class MockWorld:
     vc_reads_answer: float = 0.0
     vc_answer_signal: tuple[float, float] = (0.25, 0.95)   # (wrong, correct)
     vc_prompt_offsets: dict[str, float] | None = None
-    scale_bias: dict[str, float] | None = None
-    sycophancy_drop: float = 0.35
-    forced_decode_shift: float = 0.5   # how much an injected VC moves p_q (8.5)
-    prehoc_noise: float = 0.08         # vc_pre repeat-to-repeat instability (8.6c)
+    prehoc_noise: float = 0.08         # vc_pre repeat-to-repeat instability
     prehoc_blind_to_fabricated: bool = True
 
     def baseline_p(self, q_id: str, dataset: str) -> float:
@@ -96,16 +93,11 @@ class MockWorld:
         a, b = self.p_q_beta
         return float(_rng(self.world_seed, "p", q_id).beta(a, b))
 
-    def p_at(self, q_id: str, dataset: str, temperature: float,
-             injected_vc: float | None = None) -> float:
+    def p_at(self, q_id: str, dataset: str, temperature: float) -> float:
         p0 = self.baseline_p(q_id, dataset)
         if p0 <= 0.0:
             return 0.0
-        x = _logit(p0) - self.temp_sensitivity * (temperature - self.t_ref)
-        if injected_vc is not None:
-            # A confidence token in context perturbs the output distribution.
-            x += self.forced_decode_shift * (injected_vc - 0.5) * 2.0
-        return _sigmoid(x)
+        return _sigmoid(_logit(p0) - self.temp_sensitivity * (temperature - self.t_ref))
 
     def is_low_diversity(self, q_id: str) -> bool:
         return _u01(self.world_seed, "div", q_id) < self.low_diversity_share
@@ -124,7 +116,6 @@ class MockWorld:
         raw = self.vc_floor + (1.0 - self.vc_floor) * raw
         offsets = self.vc_prompt_offsets or {}
         raw += offsets.get(prompt_variant, 0.0)
-        raw += (self.scale_bias or {}).get(scale, 0.0)
         return float(np.clip(raw, 0.0, 1.0))
 
     def quantise_vc(self, value: float) -> float:
@@ -136,7 +127,6 @@ class MockLM:
     """Sampling generator over :class:`MockWorld`."""
 
     name = "mock-lm"
-    full_vocab_logits = True
 
     def __init__(self, world: MockWorld | None = None, vocab_size: int = 32000):
         self.world = world or MockWorld()
@@ -188,15 +178,13 @@ class MockLM:
         variant = meta.get("variant", "vc_post_v1")
         scale = meta.get("scale", "unit")
         kind = meta.get("kind", "post")
-        injected = meta.get("injected")
-        injected_vc = float(injected) if injected not in (None, "") else None
         w = self.world
-        rng = _rng(w.world_seed, "draw", q_id, seed, temperature, variant, injected)
+        rng = _rng(w.world_seed, "draw", q_id, seed, temperature, variant)
 
         if kind == "pre":
             return self._generate_pre(q_id, dataset, variant, seed, rng)
 
-        p = w.p_at(q_id, dataset, temperature, injected_vc)
+        p = w.p_at(q_id, dataset, temperature)
         is_correct = bool(rng.random() < p)
         if is_correct:
             mode, concentration = 0, 0.8
@@ -219,8 +207,6 @@ class MockLM:
         if w.vc_within_sd > 0:
             vc = float(np.clip(vc + rng.normal(0.0, w.vc_within_sd), 0.0, 1.0))
         vc = w.quantise_vc(vc)
-        if self._has_challenge(messages):
-            vc = float(np.clip(vc - w.sycophancy_drop, 0.0, 1.0))
 
         text = f"Answer: {answer}\nConfidence: {self._render_vc(vc, scale)}"
         stats = self._token_stats(max(4, min(max_tokens, 24)),
@@ -238,11 +224,6 @@ class MockLM:
         value = w.quantise_vc(value)
         stats = self._token_stats(6, concentration=0.7, key=f"pre:{q_id}:{seed}")
         return Generation(text=f"Confidence: {value:g}", stats=stats)
-
-    @staticmethod
-    def _has_challenge(messages: Sequence[dict]) -> bool:
-        return any("don't think that's right" in m.get("content", "").lower()
-                   for m in messages)
 
     @staticmethod
     def _render_vc(vc: float, scale: str) -> str:

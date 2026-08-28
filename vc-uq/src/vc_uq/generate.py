@@ -6,7 +6,8 @@ as such, and every independence statement downstream becomes untestable.
 
 Pre-hoc and post-hoc VC are elicited in separate calls. ``vc_pre`` is asked
 ``R_pre`` times per question because a prospective feeling-of-knowing with no
-answer to anchor on has sampling variance that is itself a measurement (8.6c).
+answer to anchor on has real sampling variance, and averaging over repeats keeps
+``vc_pre`` from being one noisy draw. The spread is kept alongside the mean.
 
 Token statistics are recorded twice: once under the VC-augmented prompt that
 produced the answer, and once by teacher-forcing the same answer tokens under a
@@ -65,6 +66,9 @@ class Generator:
     last_resume: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        # Before build_lm: a mistyped variant name should not cost a GGUF load,
+        # let alone surface hours later from inside Phase 5.
+        prompts.check_config_variants(self.cfg)
         self.lm = build_lm(self.cfg)
         self.is_mock = self.cfg.get("model.backend") == "mock"
         self.model_name = self.cfg.get("model.name")
@@ -330,9 +334,9 @@ def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame) -> dict:
 def attach_vc_pre(questions: pd.DataFrame, pre: pd.DataFrame) -> pd.DataFrame:
     """Summarise the R_pre repeats onto the question table.
 
-    The spread across repeats is kept, not discarded: if the same question
-    yields 0.6 and 0.9 on different draws, the feeling of knowing is not a
-    stable quantity (protocol 8.6c).
+    The spread across repeats is kept, not discarded: ``vc_pre_sd`` is what
+    tells you whether the mean is describing a stable quantity or averaging
+    noise, and Phase 2 reports it alongside the mean.
     """
     agg = (pre.groupby("q_id")["vc_pre"]
            .agg(vc_pre="mean", vc_pre_sd="std").reset_index())

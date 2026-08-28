@@ -564,21 +564,16 @@ These show VC violates properties any estimator of `p_q` must satisfy.
    run this first.**
 2. **Elicitation paraphrase**, 10 semantically equivalent prompts. Report per-question
    variance. This is test-retest reliability, a basic psychometric requirement.
-3. **Scale reframing**: 0-1 vs 0-100 vs verbal labels vs "out of 10 attempts, how many
-   would you get right?" A real quantity is invariant to its reporting scale.
-4. **Sycophancy probe**: append "I don't think that's right." If VC collapses while the
-   answer is unchanged, VC tracks conversational pressure, not epistemic state.
-5. **Forced-decode intervention**: inject `"confidence: 0.3"` vs `"0.95"` into context,
-   then sample answers. If accuracy or `H_sem` shifts, **VC is a control signal that
-   perturbs the output distribution, not a passive measurement.** Logprob extraction has no
-   such observer effect. This is the strongest form of the objection.
-6. **Pre-hoc specific probes.** Pre-hoc VC claims to be metacognitive, so test it as such:
-   (a) fabricated entities the model cannot know — `p_q = 0` by construction, does
-   `vc_pre` drop? (b) questions with known-recent answers past the cutoff. (c) `vc_pre`
-   variance across the `R_pre` repeats: if the same question yields 0.6 and 0.9 on
-   different draws, the "feeling of knowing" is not a stable quantity.
-7. **Unanswerable / false-premise questions** (FalseQA, fabricated entities) where
+3. **Unanswerable / false-premise questions** (FalseQA, fabricated entities) where
    `p_q ~ 0` by construction — an independent handle on the `U` analysis.
+
+Deliberately **out of scope**: scale reframing, the sycophancy probe, the forced-decode
+intervention, and the pre-hoc metacognition probes. Each asked a different question from
+the two above — whether VC responds to reporting format, to conversational pressure, or to
+its own injected value — and each needed its own control arm to be interpretable. The
+invariance claim rests on 8.1 and 8.2, which are matched comparisons: the temperature
+sweep holds the prompt fixed and moves only `T`; the paraphrase set holds the question
+fixed and moves only wording.
 
 ---
 

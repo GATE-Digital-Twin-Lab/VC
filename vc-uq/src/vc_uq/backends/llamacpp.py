@@ -61,8 +61,6 @@ class LlamaCppConfig:
 class LlamaCppLM:
     """Sampling + exact token statistics from a GGUF model."""
 
-    full_vocab_logits = True
-
     def __init__(self, cfg: LlamaCppConfig, *, name: str = "llamacpp"):
         Llama = _require_llama_cpp()
         self.cfg = cfg

@@ -86,6 +86,23 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
           "e is undefined at test time -- there is nothing to sweep once a_star is "
           "the reference. Only s_anchor is a valid score.")
 
+    # -- split sizes: hash assignment is only approximately proportional --
+    if questions is not None and len(questions) and "split" in questions.columns:
+        from .datasets import split_deviation
+        dev = split_deviation(questions, cfg)
+        tol = float(cfg.get("dataset.splits.max_share_deviation"))
+        worst = dev.loc[dev["share_deviation"].abs().idxmax()]
+        bad = dev[dev["share_deviation"].abs() > tol]
+        r.add("split sizes are close to their targets",
+              bad.empty, "warn",
+              f"worst: {worst['stratum']}/{worst['split']} got {int(worst['actual_n'])} "
+              f"of a target {int(worst['target_n'])} "
+              f"({worst['actual_share']:.3f} vs {worst['target_share']:.2f}). "
+              "Splits are assigned by hashing q_id, which is stable when questions "
+              "are added but only binomially proportional; small datasets deviate "
+              "most, and the fabricated set is the small one." if len(bad) else
+              f"largest deviation {abs(worst['share_deviation']):.3f} <= {tol}.")
+
     # -- anchor determinism --
     method = cfg.get("anchor.method")
     r.add("anchor is deterministic",
@@ -224,6 +241,13 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
     r.add("vc_pre is elicited with no answer in context",
           prompts.get(pre_variant).kind == "pre", "fatal",
           f"{pre_variant!r} must be a pre-hoc prompt")
+
+    # -- every config-named prompt variant actually exists --
+    unknown = prompts.unknown_config_variants(cfg)
+    r.add("every prompt variant named in config is registered",
+          not unknown, "fatal",
+          f"unregistered: {unknown}" if unknown else
+          f"{len(prompts.VARIANT_CONFIG_KEYS)} config keys checked against the registry")
 
     # -- clean-prompt h_tok --
     clean = bool(cfg.get("generation.token_stats.teacher_force_clean_prompt"))

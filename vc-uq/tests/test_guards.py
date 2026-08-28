@@ -687,3 +687,215 @@ def test_parse_audit_covers_cached_rows_not_just_new_ones(cfg):
                         .read_text(encoding="utf-8"))
     assert audit["n"] == 3 * len(questions)
     assert audit["resume"]["generated"] == 0
+
+
+# --------------------------------------------------------------------------
+# Dataset assembly, splits, and backend compatibility
+# --------------------------------------------------------------------------
+
+def test_mock_embedder_refuses_a_real_model(cfg):
+    """The mock embedder reads a tag that real model output does not carry.
+
+    Paired with a real backend it silently returns noise, the Phase 0 gate
+    fails, and the failure message blames the instrument -- which is true and
+    completely misleading. Nothing crashes, so the combination is refused here.
+    """
+    from vc_uq.backends import build_embedder, build_nli
+
+    for key, build in (("embedding.backend", build_embedder),
+                       ("nli.backend", build_nli)):
+        c = cfg.with_overrides(["model.backend=llamacpp", f"{key}=mock"])
+        with pytest.raises(ValueError, match="cannot be used with model.backend"):
+            build(c)
+
+    # The valid pairing still works, and does not reach llama-cpp-python.
+    c = cfg.with_overrides(["model.backend=mock", "embedding.backend=mock",
+                            "nli.backend=mock"])
+    assert build_embedder(c) is not None
+    assert build_nli(c) is not None
+
+
+def test_sem_tag_is_present_exactly_when_the_mock_embedder_can_read_it(cfg):
+    """The guard above is only sound if the tag really does track the LM backend."""
+    from vc_uq.datasets import build_questions
+
+    mock_q = build_questions(cfg.with_overrides(["model.backend=mock"]))
+    assert mock_q["a_star"].str.contains(r"\[\[sem:", regex=True).all()
+
+    real_q = build_questions(cfg.with_overrides(["model.backend=llamacpp"]))
+    assert not real_q["a_star"].str.contains(r"\[\[sem:", regex=True).any()
+
+
+def test_splits_are_stable_when_questions_are_added(cfg):
+    """The reason assignment is a hash rather than a shuffle.
+
+    Re-splitting must never move an already-generated question between calib and
+    eval; that would invalidate a calibration set built from expensive draws.
+    """
+    from vc_uq.datasets import assign_splits, fabricated
+
+    c = cfg.with_overrides(["model.backend=llamacpp"])
+    small = assign_splits(fabricated.build(50, 991), c)
+    big = assign_splits(fabricated.build(200, 991), c)
+
+    merged = small.merge(big, on="q_id", suffixes=("_small", "_big"))
+    assert len(merged) == 50
+    assert (merged["split_small"] == merged["split_big"]).all(), \
+        "adding questions reshuffled the ones already assigned"
+
+
+def test_split_deviation_reports_the_gap_it_cannot_remove(cfg):
+    """Hash assignment is binomial, not quota-based, so sizes miss their targets.
+
+    The imbalance is accepted (the alternative breaks add-later stability); what
+    is not accepted is failing to say so. Small strata deviate most, and the
+    fabricated set -- carrying the p_q = 0 population -- is the small one.
+    """
+    import pandas as pd
+
+    from vc_uq.datasets import assign_splits, fabricated, split_deviation
+    from vc_uq.datasets.triviaqa import build_synthetic
+
+    c = cfg.with_overrides(["model.backend=llamacpp", "run.seed=20260826"])
+    qs = pd.concat([fabricated.build(200, 991), build_synthetic(1200, 0)],
+                   ignore_index=True)
+    dev = split_deviation(assign_splits(qs, c), c)
+
+    assert set(dev["stratum"]) == {"fabricated", "triviaqa_synthetic"}
+    assert len(dev) == 8
+    for _, row in dev.iterrows():
+        assert row["actual_n"] == pytest.approx(
+            row["actual_share"] * row["n_stratum"], abs=1e-6)
+
+    small = dev[dev["stratum"] == "fabricated"]["share_deviation"].abs().max()
+    large = dev[dev["stratum"] == "triviaqa_synthetic"]["share_deviation"].abs().max()
+    assert small > large, "the small stratum should deviate more, not less"
+    assert small > 0.04, "this seed is the one that exercises a material gap"
+
+
+def test_pitfall_flags_a_lopsided_split(cfg):
+    """The deviation has to reach the report, not just a CSV."""
+    import pandas as pd
+
+    from vc_uq.datasets import assign_splits, fabricated
+    from vc_uq.datasets.triviaqa import build_synthetic
+    from vc_uq.pitfalls import run_checks
+
+    c = cfg.with_overrides(["model.backend=llamacpp", "run.seed=20260826"])
+    qs = assign_splits(pd.concat([fabricated.build(200, 991),
+                                  build_synthetic(1200, 0)], ignore_index=True), c)
+    name = "split sizes are close to their targets"
+
+    strict = run_checks(c.with_overrides(["dataset.splits.max_share_deviation=0.01"]),
+                        questions=qs)
+    check = next(x for x in strict.checks if x.name == name)
+    assert check.passed is False and check.severity == "warn"
+    assert "of a target" in check.detail
+
+    lenient = run_checks(c.with_overrides(["dataset.splits.max_share_deviation=0.5"]),
+                         questions=qs)
+    assert next(x for x in lenient.checks if x.name == name).passed is True
+
+
+def test_fabricated_questions_are_unique_and_known_unanswerable(cfg):
+    from vc_uq.datasets import fabricated
+
+    df = fabricated.build(200, 991)
+    assert len(df) == 200
+    assert df["question"].nunique() == 200
+    assert (df["p_q_true"] == 0.0).all(), "p_q = 0 is the whole point of this set"
+    assert (df["a_star"] == fabricated.A_STAR).all()
+
+    with pytest.raises(ValueError, match=r"exhausted at \d+ unique questions.*reach 5000"):
+        fabricated.build(5000, 991)
+
+
+# --------------------------------------------------------------------------
+# Prompt registry
+# --------------------------------------------------------------------------
+
+def test_verbal_confidence_is_mapped_onto_the_ladder_not_discarded():
+    """No prompt asks for a word -- every elicitation asks for a number in [0, 1].
+
+    Models answer "fairly confident" anyway. Mapping such a reply onto the ladder
+    keeps it as data instead of booking it as a parse failure, which would
+    understate the elicitation rate. The ladder lives with the prompts because it
+    is elicitation vocabulary; parsing imports the one definition.
+    """
+    from vc_uq import prompts
+    from vc_uq.parsing import VERBAL_SCALE, parse_vc_value
+
+    assert VERBAL_SCALE is prompts.VERBAL_SCALE
+    assert list(VERBAL_SCALE.values()) == sorted(VERBAL_SCALE.values()),         "insertion order is the ladder, so the values must ascend"
+
+    for word, value in VERBAL_SCALE.items():
+        assert parse_vc_value(word, "unit") == (value, "ok"), word
+    # Longest label first, so the substring match cannot swallow the qualifier.
+    assert parse_vc_value("highly confident", "unit")[0] == 0.95
+    assert parse_vc_value("confident", "unit")[0] == 0.85
+
+
+def test_unknown_prompt_variant_fails_before_the_model_loads(cfg):
+    """A typo must not surface hours into Phase 5, after a full generation."""
+    from vc_uq import prompts
+    from vc_uq.generate import Generator
+    from vc_uq.store import Store
+
+    bad = cfg.with_overrides(["phase5.paraphrase.variants=[vc_post_v1,vc_post_v99]"])
+    assert prompts.unknown_config_variants(bad) == {
+        "phase5.paraphrase.variants": ["vc_post_v99"]}
+
+    store = Store(bad)
+    with pytest.raises(KeyError, match="unknown prompt variant"):
+        Generator(bad, store)
+
+    assert prompts.unknown_config_variants(cfg) == {}
+    assert Generator(cfg, Store(cfg)) is not None
+
+
+def test_every_config_named_variant_is_registered(cfg):
+    """The shipped config must not name a variant that does not exist."""
+    from vc_uq import prompts
+
+    for key in prompts.VARIANT_CONFIG_KEYS:
+        value = cfg.get(key, None)
+        assert value is not None, f"{key} vanished from the config"
+    prompts.check_config_variants(cfg)
+
+
+def test_pitfall_reports_an_unregistered_variant(cfg):
+    from vc_uq.pitfalls import run_checks
+
+    name = "every prompt variant named in config is registered"
+    bad = cfg.with_overrides(["generation.prompt_variant_post=nope_v1"])
+    check = next(c for c in run_checks(bad).checks if c.name == name)
+    assert check.passed is False and check.severity == "fatal"
+    assert next(c for c in run_checks(cfg).checks if c.name == name).passed is True
+
+
+def test_prehoc_prompt_carries_no_answer_and_is_marked_pre():
+    """vc_pre and vc_post are different constructs; the registry encodes which."""
+    from vc_uq import prompts
+
+    spec = prompts.get("vc_pre_v1")
+    assert spec.kind == "pre"
+    body = " ".join(m["content"] for m in spec.build(question="Q"))
+    assert "Do NOT answer" in body
+    assert "Answer:" not in body, "a pre-hoc prompt must not solicit an answer"
+
+    assert all(prompts.get(v).kind == "post"
+               for v in prompts.variants("post"))
+    assert prompts.variants("pre") == ["vc_pre_v1"]
+
+
+def test_paraphrase_variants_differ_only_in_wording():
+    """Per-question spread across them is test-retest reliability, so message
+    structure has to be held constant or the spread measures something else."""
+    from vc_uq import prompts
+
+    built = [prompts.get(v).build(question="Q") for v in
+             [f"vc_post_v{i}" for i in range(1, 11)]]
+    assert all(len(m) == 2 for m in built)
+    assert len({tuple(x["role"] for x in m) for m in built}) == 1
+    assert len({m[1]["content"] for m in built}) == 1, "the user turn must be identical"
+    assert len({m[0]["content"] for m in built}) == 10, "systems must all differ"

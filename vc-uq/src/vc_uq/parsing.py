@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .prompts import Scale
+from .prompts import VERBAL_SCALE, Scale  # noqa: F401  -- re-exported
 
 _ANSWER_RE = re.compile(r"^\s*answer\s*[:\-]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 _CONF_RE = re.compile(
@@ -20,21 +20,6 @@ _CONF_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_NUM_RE = re.compile(r"(?<![\w.])(?P<value>[01](?:\.\d+)?|0?\.\d+|\d{1,3}\s*%)(?![\w.])")
-
-# Ordered ladder for the verbal scale (protocol 8.3). Midpoints of ten equal bins.
-VERBAL_SCALE: dict[str, float] = {
-    "impossible": 0.00,
-    "doubtful": 0.10,
-    "unlikely": 0.20,
-    "uncertain": 0.30,
-    "even": 0.50,
-    "likely": 0.65,
-    "probable": 0.75,
-    "confident": 0.85,
-    "highly confident": 0.95,
-    "certain": 1.00,
-}
-
 
 class ParseFailure(str):
     """Reason codes for the parse audit."""
@@ -84,8 +69,9 @@ def parse_vc_value(text: str, scale: Scale = "unit") -> tuple[float | None, str]
         value = value / 10.0
     elif scale == "unit" and value > 1.0:
         # The model answered on a scale it was not asked for. Rescaling here
-        # would hide a scale-invariance violation, so record it as out of range
-        # and let 8.3 report it.
+        # would launder a failure to follow the elicitation format into a valid
+        # reading, so it is recorded as out of range and shows up in the parse
+        # audit instead.
         if value <= 100.0:
             return None, OUT_OF_RANGE
         return None, UNPARSEABLE_VALUE

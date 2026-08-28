@@ -117,7 +117,6 @@ def main(argv: list[str] | None = None) -> int:
             "phase5.temperature_sweep.n_questions=15",
             "phase5.temperature_sweep.n_draws=8",
             "phase5.temperature_sweep.temperatures=[0.0, 0.8, 1.5]",
-            "phase5.forced_decode.n_draws=5",
         ])
         store = Store(cfg, run_id=args.run_id)
         state = pipeline.run_all(cfg, simulate_labels=True, store=store)

@@ -212,7 +212,36 @@ worlds.
 Knobs live under `model.mock` in the config. `vc_reads_answer` is the one that
 flips the central prediction: at 0, post-hoc VC ignores the answer it just
 produced and within-question AUROC sits at 0.5; at 1 it reads it and the AUROC
-goes above 0.9.
+goes above 0.9. `prehoc_blind_to_fabricated` decides whether the simulated
+`vc_pre` notices an invented entity.
+
+The mock **embedder** and mock **NLI judge** are part of that same world: they
+score by reading a hidden `[[sem:...]]` tag the simulated model writes into
+every answer. Real model output carries no such tag, so pairing either with
+`model.backend: llamacpp` would silently reduce every similarity to noise — the
+Phase 0 gate would fail and blame the instrument, which is true and completely
+misleading. `build_embedder` and `build_nli` refuse that combination outright.
+
+## Splits are stable, not exact
+
+Split assignment hashes `q_id`, so it does not depend on what else is in the
+dataset. Adding questions next month cannot move a question already generated
+from `calib` to `eval` — which would silently invalidate a calibration set built
+from expensive draws.
+
+The price is that sizes are *binomial around* their targets rather than exact
+quotas. At n = 1200 that is invisible (shares land within ~0.01); at n = 200 a
+35% split lands anywhere from 56 to 75. `stratify_by` does not fix this: it
+salts the hash per group so groups are assigned independently, it does not deal
+quotas within them. Exact quotas would require ranking questions against each
+other, and then adding one question could move a *different* one across the
+calib/eval boundary — a far worse failure.
+
+So the imbalance is accepted and **reported**: every run writes
+`tables/dataset_split_deviation.csv`, and a pitfall check fails when any stratum
+misses its target share by more than `dataset.splits.max_share_deviation`. This
+matters most for the fabricated set, which is small and carries the `p_q = 0`
+population that the U-cell analysis rests on.
 
 ## Things the code refuses to do
 
@@ -260,9 +289,12 @@ default config passes, so the checks are not unconditionally pessimistic.
 - Per-position token entropies are stored for a 10% subsample only
   (`generation.token_stats.store_per_position_fraction`); summaries are kept for
   every draw.
-- §8.6(b) — pre-hoc VC on questions with known-recent answers past the training
-  cutoff — is **not implemented**. It needs a dated dataset that does not exist
-  here. 8.6(a) and 8.6(c) are.
+- Phase 5 is the temperature sweep (§8.1) and the paraphrase set (§8.2) only.
+  Scale reframing, the sycophancy probe, the forced-decode intervention and the
+  pre-hoc metacognition probes are **out of scope**: each varied more than one
+  thing at a time and needed its own control arm to be interpretable. The two
+  that remain are matched comparisons — the sweep moves only `T`, the paraphrase
+  set moves only wording.
 - The §7.1 robustness pass (all questions, `alpha > beta`) runs automatically
   after the primary restricted-to-`A` table. Where every configured robustness
   alpha sits at or below `beta`, it is skipped with a note rather than reported

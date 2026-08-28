@@ -5,10 +5,11 @@ true per-sample correctness probability is exactly zero -- not estimated, known.
 That makes them the only place in the study where the estimand itself is
 observable, which the protocol leans on twice:
 
-  * 8.6(a) -- does ``vc_pre`` drop for what the model cannot possibly know?
   * 6.4-6.6 -- a guaranteed non-empty ``U`` with known membership, and the
     cleanest population of the low-diversity-``U`` cell (a confident, stable,
     fabricated belief).
+  * 8.3 -- unanswerable questions as an independent handle on that ``U``
+    analysis, since membership is known rather than inferred.
 
 Generated rather than downloaded so that ``p_q = 0`` is guaranteed: any harvested
 "unanswerable" set risks containing items the model can in fact answer.
@@ -88,6 +89,6 @@ def build(n_questions: int, seed: int = 991) -> pd.DataFrame:
     if len(rows) < n_questions:
         raise ValueError(
             f"template pool exhausted at {len(rows)} unique questions; "
-            "add templates or entities to reach {n_questions}"
+            f"add templates or entities to reach {n_questions}"
         )
     return pd.DataFrame(rows)

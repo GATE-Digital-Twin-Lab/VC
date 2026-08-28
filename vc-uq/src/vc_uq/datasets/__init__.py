@@ -58,6 +58,17 @@ def assign_splits(questions: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     Assignment is a hash of ``q_id``, so it is stable across runs and across
     machines: adding questions later cannot reshuffle the ones already
     generated, which would silently invalidate a calibration set.
+
+    The cost of that stability is that the split sizes are only APPROXIMATELY
+    proportional. Each question is assigned independently, so the counts are
+    binomial around the target rather than exact quotas -- at n = 200 a 35%
+    split lands anywhere from about 56 to 75. Exact quotas would require ranking
+    questions against each other, and then adding one question could move a
+    different question from calib to eval, which is a far worse failure than a
+    few percent of imbalance. ``stratify_by`` does not change this: it salts the
+    hash per group so the groups are assigned independently, it does not deal
+    out quotas within them. Use :func:`split_deviation` to see what a given seed
+    actually produced; a pitfall check reads it.
     """
     fracs = {s: float(cfg.get(f"dataset.splits.{s}")) for s in SPLITS}
     total = sum(fracs.values())
@@ -77,6 +88,38 @@ def assign_splits(questions: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         [""] * len(out), index=out.index)
     out["split"] = [_assign(q, g) for q, g in zip(out["q_id"], groups)]
     return out
+
+
+def split_deviation(questions: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Realised split shares against the configured targets, per stratum.
+
+    Assignment is independent per question (see :func:`assign_splits`), so the
+    realised shares are binomial noise around the target. Small datasets deviate
+    most, and the fabricated set -- the one carrying the p_q = 0 population that
+    the U-cell analysis rests on -- is the small one. Reporting the
+    gap is the fix; silently approximating it is the problem.
+    """
+    fracs = {s: float(cfg.get(f"dataset.splits.{s}")) for s in SPLITS}
+    stratify = cfg.get("dataset.splits.stratify_by", None)
+    group = stratify if stratify and stratify in questions.columns else None
+
+    rows = []
+    keys = questions[group].unique() if group else [None]
+    for k in keys:
+        sub = questions if k is None else questions[questions[group] == k]
+        n = len(sub)
+        counts = sub["split"].value_counts()
+        for s in SPLITS:
+            actual = int(counts.get(s, 0))
+            rows.append({
+                "stratum": "all" if k is None else str(k),
+                "split": s, "n_stratum": n,
+                "target_share": fracs[s], "target_n": int(round(n * fracs[s])),
+                "actual_n": actual,
+                "actual_share": (actual / n) if n else float("nan"),
+                "share_deviation": (actual / n - fracs[s]) if n else float("nan"),
+            })
+    return pd.DataFrame(rows)
 
 
 def split_summary(questions: pd.DataFrame) -> pd.DataFrame:

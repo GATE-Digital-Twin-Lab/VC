@@ -1,18 +1,31 @@
-"""Phase orchestration, in the protocol's build order (section 10).
+"""Phase orchestration.
 
-  1. Phase 5.1 temperature sweep      -- does the headline effect exist at all?
-  2. Phase 0 instrument validation    -- GATE: kappa >= 0.7, AUROC >= 0.85
-  3. Phase 1 full generation + cache  -- GATE: KM flat by N_MAX
-  4. Phase 3 survival, beta, U/A, 2x2 -- beta known BEFORE any alpha is chosen
-  5. Phase 2 descriptive
-  6. Phase 4 CLM + LTT                -- GATE: Lambda_hat non-empty, non-vacuous
-  7. Phases 5.2-5.6, Phase 6
+**Step names encode the protocol's section 10 numbering, NOT the order they
+run in.** ``run_all`` executes them like this:
 
-The order is not cosmetic. The temperature sweep is first because it is the
-cheapest signal and the strongest claim. Phase 0 is second because nothing
-downstream is interpretable through a blunt instrument. ``beta`` precedes any
-choice of ``alpha`` because choosing alpha below beta produces a blank table for
-arithmetic reasons that have nothing to do with VC.
+  step3_generate     Phase 1 full generation + cache  -- GATE: KM flat by N_MAX
+  step2_gate         Phase 0 instrument validation    -- GATE: kappa >= 0.7, AUROC >= 0.85
+  step1_temperature  Phase 5.1 temperature sweep      -- does the headline effect exist at all?
+  step4_survival     Phase 3 survival, beta, U/A, 2x2 -- beta known BEFORE any alpha is chosen
+  step5_descriptive  Phase 2 descriptive
+  step6_clm          Phase 4 CLM + LTT                -- GATE: Lambda_hat non-empty, non-vacuous
+  step7              Phases 5.2-5.6, Phase 6
+
+The first three are swapped relative to section 10 because of two hard
+dependencies: the gate labels REAL DRAWS, so generation must precede it; and
+once the gate has run, the sweep can use the validated ``tau_star`` instead of a
+provisional one. Section 10 puts the sweep first for a different reason -- it is
+the cheapest STANDALONE probe, answering "is there an effect at all?" before
+anyone commits to a full generation. That path is still available and still
+first: ``vc_uq step1`` runs the sweep alone, against a provisional tau, and says
+so in a note.
+
+Nothing after that is negotiable. Phase 0 gates everything because no downstream
+number is interpretable through an unvalidated instrument. ``beta`` is fixed in
+step 4, before step 6 chooses any ``alpha``, because an alpha below beta produces
+a blank certification table for arithmetic reasons that have nothing to do with
+VC -- and a reader who saw the blank table without beta would draw exactly the
+wrong conclusion.
 """
 
 from __future__ import annotations
@@ -20,16 +33,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from . import calibration, cluster, invariance, judge, phase0, plots, survival, transfer
-from .backends import build_embedder, build_lm, build_nli
+from .backends import build_embedder, build_nli
 from .clm import build_traces, run_phase4, stratified_discount
 from .config import Config
 from .generate import Generator, run_phase1
 from .pitfalls import run_checks
-from .schemas import QUESTIONS_SCHEMA, assert_split_by_question
+from .schemas import assert_split_by_question
 from .store import Store
 
 
@@ -423,50 +435,21 @@ def step6_clm(state: PipelineState) -> PipelineState:
 
 
 # --------------------------------------------------------------------------
-# Step 7 -- remaining invariance probes and transfer
+# Step 7 -- paraphrase reliability (8.2) and recalibration transfer (Phase 6)
 # --------------------------------------------------------------------------
 
 def step7_invariance_transfer(state: PipelineState) -> PipelineState:
     cfg, store = state.cfg, state.store
     gen = Generator(cfg, store)
-    embedder = build_embedder(cfg)
     questions = state.questions
     eval_q = questions[questions["split"] == "eval"]
     probe_q = eval_q.head(int(cfg.get("phase5.temperature_sweep.n_questions")))
-
-    def judge_fn(df: pd.DataFrame) -> pd.DataFrame:
-        scored, _ = judge.score_answers(cfg, df, questions, embedder=embedder)
-        tau = cfg.get("judge.tau_star", None)
-        tau = float(tau) if tau is not None else float(
-            state.gate.tau_star if state.gate else scored["e_cos"].median())
-        scored = judge.apply_tau(scored, tau)
-        scored["correct"] = scored["correct_cos"].astype(bool)
-        return scored
 
     out: dict = {}
 
     per_q, para = invariance.paraphrase_reliability(cfg, gen, probe_q)
     store.write_table("phase5_2_paraphrase_per_question", per_q)
     out["paraphrase"] = para
-
-    scales_df, scales = invariance.scale_reframing(cfg, gen, probe_q)
-    store.write_table("phase5_3_scale_reframing", scales_df)
-    out["scale_reframing"] = scales
-
-    syco_df, syco = invariance.sycophancy_probe(
-        cfg, gen, probe_q, state.answers[state.answers["q_id"].isin(set(probe_q["q_id"]))])
-    store.write_table("phase5_4_sycophancy", syco_df)
-    out["sycophancy"] = syco
-
-    nli = build_nli(cfg)
-    forced_df, forced = invariance.forced_decode(
-        cfg, gen, probe_q, judge_fn,
-        cluster_fn=lambda d: cluster.cluster_frame(cfg, d, nli=nli))
-    store.write_table("phase5_5_forced_decode", forced_df)
-    out["forced_decode"] = forced
-
-    out["prehoc"] = invariance.prehoc_probes(cfg, questions,
-                                             store.read_vc_pre_repeats())
 
     eval_answers = state.answers[state.answers["split"] == "eval"]
     table, tsum = transfer.transfer_study(cfg, eval_answers)
@@ -475,7 +458,7 @@ def step7_invariance_transfer(state: PipelineState) -> PipelineState:
     store.write_table("phase6_isotonic_compounding", compounding)
     out["transfer"] = tsum
 
-    store.write_json("phase5_6_summary", out)
+    store.write_json("phase5_summary", out)
     state.results["step7"] = out
     return state
 
@@ -487,7 +470,7 @@ def step7_invariance_transfer(state: PipelineState) -> PipelineState:
 def run_all(cfg: Config, *, simulate_labels: bool = False,
             labels_path: str | None = None,
             skip: tuple[str, ...] = (), store: Store | None = None) -> PipelineState:
-    from .datasets import build_questions, split_summary
+    from .datasets import build_questions, split_deviation, split_summary
 
     # A full run always gets its own timestamped directory; per-phase CLI
     # commands attach to an existing one instead.
@@ -495,12 +478,12 @@ def run_all(cfg: Config, *, simulate_labels: bool = False,
     state = PipelineState(cfg=cfg, store=store)
     state.questions = build_questions(cfg)
     store.write_table("dataset_splits", split_summary(state.questions))
+    store.write_table("dataset_split_deviation",
+                      split_deviation(state.questions, cfg))
 
-    # Generation must precede the gate (the gate labels real draws), and the
-    # gate precedes the sweep so the sweep can use the validated tau_star rather
-    # than a provisional one. The protocol's ordering of the sweep first is
-    # about it being the cheapest STANDALONE probe -- `vc_uq step1` still runs
-    # it on its own, before anything else exists.
+    # Execution order, not section-10 order -- see the module docstring. The
+    # first three are swapped: the gate labels real draws (so generation first),
+    # and the sweep wants the gate's validated tau_star (so the gate second).
     steps = [
         ("step3_generate", step3_generate),
         ("step2_gate", lambda s: step2_gate(s, simulate_labels=simulate_labels,

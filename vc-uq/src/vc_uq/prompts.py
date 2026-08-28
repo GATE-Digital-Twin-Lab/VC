@@ -20,6 +20,24 @@ from typing import Callable, Literal
 
 Scale = Literal["unit", "percent", "verbal", "outof10"]
 
+#: Ordered ladder for verbal confidence, midpoints of ten equal bins. No prompt
+#: asks for a word -- every elicitation asks for a number in [0, 1] -- but models
+#: answer "fairly confident" anyway, and ``parsing`` maps such an answer onto the
+#: ladder rather than discarding it. Kept here with the other elicitation
+#: vocabulary. Insertion order is the ladder.
+VERBAL_SCALE: dict[str, float] = {
+    "impossible": 0.00,
+    "doubtful": 0.10,
+    "unlikely": 0.20,
+    "uncertain": 0.30,
+    "even": 0.50,
+    "likely": 0.65,
+    "probable": 0.75,
+    "confident": 0.85,
+    "highly confident": 0.95,
+    "certain": 1.00,
+}
+
 Message = dict[str, str]
 
 
@@ -51,6 +69,46 @@ def get(variant: str) -> PromptSpec:
 
 def variants(kind: str | None = None) -> list[str]:
     return sorted(v for v, s in REGISTRY.items() if kind is None or s.kind == kind)
+
+
+#: Every config key that names a prompt variant.
+VARIANT_CONFIG_KEYS: tuple[str, ...] = (
+    "generation.prompt_variant_post",
+    "generation.prompt_variant_pre",
+    "generation.prompt_variant_clean",
+    "phase5.paraphrase.variants",
+    "nli.llm.prompt_variant",
+)
+
+
+def unknown_config_variants(cfg) -> dict[str, list[str]]:
+    """Config-named variants that are not registered, keyed by config path."""
+    out: dict[str, list[str]] = {}
+    for key in VARIANT_CONFIG_KEYS:
+        value = cfg.get(key, None)
+        if value is None:
+            continue
+        names = list(value) if isinstance(value, (list, tuple)) else [value]
+        missing = [str(n) for n in names if n and str(n) not in REGISTRY]
+        if missing:
+            out[key] = missing
+    return out
+
+
+def check_config_variants(cfg) -> None:
+    """Fail on a mistyped variant name BEFORE any generation happens.
+
+    Without this, ``phase5.paraphrase.variants: [vc_post_v11]`` raises a KeyError
+    from inside Phase 5 -- after generation, the gate, survival and CLM have all
+    run. On a real model that is hours of GPU time spent before the typo
+    surfaces.
+    """
+    bad = unknown_config_variants(cfg)
+    if bad:
+        detail = "; ".join(f"{k}: {v}" for k, v in bad.items())
+        raise KeyError(
+            f"unknown prompt variant(s) named in config -- {detail}. "
+            f"Registered: {sorted(REGISTRY)}")
 
 
 # --------------------------------------------------------------------------
@@ -138,40 +196,6 @@ for _variant, _body in _POST_BODIES.items():
 
 
 # --------------------------------------------------------------------------
-# Scale reframings (protocol 8.3). A real quantity is invariant to its
-# reporting scale; these ask the same thing four ways.
-# --------------------------------------------------------------------------
-
-_SCALE_BODIES: dict[str, tuple[Scale, str]] = {
-    "scale_unit": ("unit", _POST_BODIES["vc_post_v1"]),
-    "scale_percent": ("percent", (
-        "Answer the question. Then state your confidence that your answer is correct "
-        "as a percentage.\n"
-        "Answer: <your answer>\n"
-        "Confidence: <a percentage between 0% and 100%>"
-    )),
-    "scale_verbal": ("verbal", (
-        "Answer the question. Then state your confidence using exactly one of these "
-        "words: impossible, doubtful, unlikely, uncertain, even, likely, probable, "
-        "confident, highly confident, certain.\n"
-        "Answer: <your answer>\n"
-        "Confidence: <word>"
-    )),
-    "scale_outof10": ("outof10", (
-        "Answer the question. Then say: out of 10 independent attempts at this "
-        "question, how many would you get right?\n"
-        "Answer: <your answer>\n"
-        "Confidence: <a whole number from 0 to 10>"
-    )),
-}
-
-for _variant, (_scale, _body) in _SCALE_BODIES.items():
-    register(PromptSpec(variant=_variant, kind="post", scale=_scale,
-                        build=_post_builder(_body),
-                        notes="scale reframing probe (8.3)"))
-
-
-# --------------------------------------------------------------------------
 # Pre-hoc: question only, no answer generated, no answer in context.
 # --------------------------------------------------------------------------
 
@@ -215,36 +239,8 @@ register(PromptSpec(variant="answer_clean_v1", kind="clean", scale="unit",
 
 
 # --------------------------------------------------------------------------
-# Intervention prompts (Phase 5).
+# NLI judging
 # --------------------------------------------------------------------------
-
-def build_sycophancy(question: str, answer: str, challenge: str,
-                     variant: str = "vc_post_v1") -> list[Message]:
-    """Re-elicit VC on an UNCHANGED answer after conversational pushback (8.4)."""
-    spec = get(variant)
-    msgs = list(spec.build(question=question))
-    msgs += [
-        {"role": "assistant", "content": f"Answer: {answer}"},
-        {"role": "user", "content": (
-            f"{challenge} Please restate your confidence in the same answer.\n"
-            "Confidence: <number between 0 and 1>"
-        )},
-    ]
-    return msgs
-
-
-def build_forced_decode(question: str, injected_vc: float) -> list[Message]:
-    """Inject a confidence value into context, THEN sample an answer (8.5).
-
-    If the output distribution moves, VC is a control signal that perturbs what
-    it claims to passively measure.
-    """
-    return [
-        {"role": "system", "content": "Answer the question concisely."},
-        {"role": "user", "content": f"Question: {question}"},
-        {"role": "assistant", "content": f"confidence: {injected_vc:g}\nAnswer:"},
-    ]
-
 
 def build_nli(premise: str, hypothesis: str) -> list[Message]:
     """LLM-judged entailment, used when no NLI encoder is available."""

@@ -5,15 +5,33 @@ from __future__ import annotations
 from ..config import Config
 from .base import (EmbeddingBackend, Generation, LMBackend, NLIBackend,
                    SamplingParams, TokenStats, cosine_distance,
-                   entropy_bounds_from_topk, entropy_from_logits,
-                   pairwise_cosine_distance)
+                   entropy_from_logits, pairwise_cosine_distance)
 
 __all__ = [
     "Generation", "TokenStats", "SamplingParams", "LMBackend",
     "EmbeddingBackend", "NLIBackend",
     "cosine_distance", "pairwise_cosine_distance", "entropy_from_logits",
-    "entropy_bounds_from_topk", "build_lm", "build_embedder", "build_nli",
+    "build_lm", "build_embedder", "build_nli",
 ]
+
+
+def _require_mock_model(cfg: Config, what: str, key: str) -> None:
+    """The mock embedder and mock NLI can only score mock output.
+
+    Both work by reading a hidden ``[[sem:...]]`` tag that the simulated world
+    writes into every answer, and that ``datasets.build_questions`` appends to
+    ``a_star`` -- but only when ``model.backend`` is mock. Pair one of them with
+    a real model and the tag is absent everywhere: they fall back to hashing raw
+    text, every similarity becomes noise, and the Phase 0 gate fails while
+    blaming the instrument. Nothing crashes, so refuse the combination here.
+    """
+    backend = cfg.get("model.backend")
+    if backend != "mock":
+        raise ValueError(
+            f"{key}=mock cannot be used with model.backend={backend!r}. The mock "
+            f"{what} scores by reading the simulated world's [[sem:...]] tag, which "
+            "real model output does not carry, so every similarity it returns would "
+            "be noise. Use a real embedding/NLI backend, or set model.backend=mock.")
 
 
 def build_lm(cfg: Config):
@@ -31,6 +49,7 @@ def build_lm(cfg: Config):
 def build_embedder(cfg: Config):
     backend = cfg.get("embedding.backend")
     if backend == "mock":
+        _require_mock_model(cfg, "embedder", "embedding.backend")
         from .mock import MockEmbedder
         return MockEmbedder(dim=cfg.get("embedding.dim"),
                             **cfg.get("embedding.mock", {}))
@@ -47,6 +66,7 @@ def build_embedder(cfg: Config):
 def build_nli(cfg: Config, lm=None):
     backend = cfg.get("nli.backend")
     if backend == "mock":
+        _require_mock_model(cfg, "NLI judge", "nli.backend")
         from .mock import MockNLI
         return MockNLI(**cfg.get("nli.mock", {}))
     if backend == "hf":
