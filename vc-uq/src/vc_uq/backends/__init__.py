@@ -59,7 +59,7 @@ def build_embedder(cfg: Config):
                                 name=cfg.get("embedding.name"))
     if backend == "sentence_transformers":
         from .hf_nli import STEmbedder
-        return STEmbedder(cfg.get("embedding.sentence_transformers.name"))
+        return STEmbedder(**cfg.section("embedding.sentence_transformers"))
     raise ValueError(f"unknown embedding.backend {backend!r}")
 
 

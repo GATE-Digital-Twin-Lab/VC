@@ -13,12 +13,33 @@ from dataclasses import dataclass
 
 from .prompts import VERBAL_SCALE, Scale  # noqa: F401  -- re-exported
 
-_ANSWER_RE = re.compile(r"^\s*answer\s*[:\-]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+# Instruct models decorate. The fields are located by NAME, wherever they fall:
+# any preamble, any number of blank lines, trailing chatter and markdown around
+# the label are all tolerated, because none of them change what was said. What
+# cannot be recovered here is text the model never emitted -- see the note on
+# stop sequences in config/default.yaml.
+_LEAD = r"[\s>*_#\-]*"          # bullets, block quotes, bold/italic markers
+_MK = r"[*_`\s]*"               # markup hugging the colon
+_ANSWER_RE = re.compile(rf"^{_LEAD}answer{_MK}[:\-]{_MK}(.+?)\s*$",
+                        re.IGNORECASE | re.MULTILINE)
+_CONF_LINE_RE = re.compile(rf"^{_LEAD}(?:confidence|certainty|probability)",
+                           re.IGNORECASE)
 _CONF_RE = re.compile(
-    r"(?:confidence|certainty|probability)\s*[:\-]?\s*"
+    rf"(?:confidence|certainty|probability){_MK}[:\-]?{_MK}"
     r"(?P<value>[0-9]*\.?[0-9]+\s*%?|[A-Za-z][A-Za-z ]{2,24})",
     re.IGNORECASE,
 )
+#: Stripped from the ends of a captured answer so "**Lisbon**" scores as
+#: "Lisbon". The answer text feeds e_cos against a_star, so leftover markup is
+#: noise in the correctness criterion rather than a cosmetic issue.
+_MARKUP_CHARS = "*_`~ "
+#: A leading bullet or block-quote marker, which must be followed by whitespace
+#: so that an answer like "-40 degrees" keeps its sign.
+_BULLET_RE = re.compile(r"^\s*(?:[-*+>#]+\s+)+")
+
+
+def _strip_markup(text: str) -> str:
+    return _BULLET_RE.sub("", text).strip().strip(_MARKUP_CHARS).strip()
 _BARE_NUM_RE = re.compile(r"(?<![\w.])(?P<value>[01](?:\.\d+)?|0?\.\d+|\d{1,3}\s*%)(?![\w.])")
 
 class ParseFailure(str):
@@ -87,13 +108,13 @@ def parse_answer_and_vc(text: str, scale: Scale = "unit",
 
     m_ans = _ANSWER_RE.search(raw)
     if m_ans is not None:
-        answer = m_ans.group(1).strip()
+        answer = _strip_markup(m_ans.group(1))
         answer_status = OK
     else:
         # Fall back to the first non-empty line that is not the confidence line.
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        lines = [ln for ln in lines if not _CONF_RE.match(ln)]
-        answer = lines[0] if lines else ""
+        lines = [ln for ln in lines if not _CONF_LINE_RE.match(ln)]
+        answer = _strip_markup(lines[0]) if lines else ""
         answer_status = OK if lines else NO_ANSWER_FIELD
 
     m_conf = _CONF_RE.search(raw)

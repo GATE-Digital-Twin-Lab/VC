@@ -70,6 +70,12 @@ class Generator:
         # let alone surface hours later from inside Phase 5.
         prompts.check_config_variants(self.cfg)
         self.lm = build_lm(self.cfg)
+        # h_tok is only comparable across the sampling and teacher-forced passes
+        # if both used the same chat template, so record which one that was.
+        source = getattr(self.lm, "prompt_template_source", None)
+        if source is not None:
+            self.store.write_manifest(status="running",
+                                      extra={"prompt_template_source": source})
         self.is_mock = self.cfg.get("model.backend") == "mock"
         self.model_name = self.cfg.get("model.name")
         self.run_seed = int(self.cfg.get("run.seed"))

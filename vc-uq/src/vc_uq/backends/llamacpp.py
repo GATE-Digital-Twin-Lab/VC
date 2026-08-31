@@ -17,7 +17,6 @@ against the mock backend -- runs without llama-cpp-python installed.
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -58,6 +57,82 @@ class LlamaCppConfig:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+def _jinja_formatter(template: str, *, bos_token: str, eos_token: str):
+    """The model's own Jinja chat template, wrapped by llama-cpp-python.
+
+    Split out so the resolution ORDER below can be tested without
+    llama-cpp-python installed.
+    """
+    from llama_cpp.llama_chat_format import Jinja2ChatFormatter  # type: ignore
+
+    formatter = Jinja2ChatFormatter(template=template, bos_token=bos_token,
+                                    eos_token=eos_token)
+    return lambda msgs: formatter(messages=list(msgs)).prompt
+
+
+def _named_formatter(name: str):
+    """A chat format requested explicitly via ``model.llamacpp.chat_format``."""
+    from llama_cpp import llama_chat_format  # type: ignore
+
+    flat = name.lower().replace("-", "").replace("_", "")
+    snake = name.lower().replace("-", "_")
+    for candidate in (f"format_{flat}", f"format_{snake}"):
+        fn = getattr(llama_chat_format, candidate, None)
+        if fn is not None:
+            return lambda msgs: fn(messages=list(msgs)).prompt
+    return None
+
+
+def _special_token(llm, which: str) -> str:
+    tok = llm.token_bos() if which == "bos" else llm.token_eos()
+    getter = getattr(getattr(llm, "_model", None), "token_get_text", None)
+    if getter is not None:
+        return str(getter(tok))
+    return llm.detokenize([tok]).decode("utf-8", errors="replace")
+
+
+def resolve_chat_formatter(llm, *, chat_format: str | None = None):
+    """Return ``(render(messages) -> str, source)``, or raise.
+
+    The refusal at the end is the point. An earlier version fell back to
+    ``format_llama3`` and then to hand-concatenated "role: content" text,
+    neither of which raises. With a non-Llama GGUF the first emits Llama-3
+    control tokens the model has never seen in that arrangement and the second
+    emits no control tokens at all -- so the run completes, the tables fill, and
+    every token statistic describes the wrong context. Since the token-entropy
+    family is what VC is being COMPARED AGAINST, a silently degraded baseline
+    flatters VC. Better to stop and say so.
+    """
+    handler = getattr(llm, "chat_handler", None) or getattr(llm, "_chat_handler", None)
+    fmt = getattr(handler, "to_chat_completion_prompt", None)
+    if fmt is not None:
+        return (lambda msgs: fmt(list(msgs))), "chat_handler.to_chat_completion_prompt"
+
+    template = (getattr(llm, "metadata", None) or {}).get("tokenizer.chat_template")
+    if template:
+        return (_jinja_formatter(template,
+                                 bos_token=_special_token(llm, "bos"),
+                                 eos_token=_special_token(llm, "eos")),
+                "gguf tokenizer.chat_template")
+
+    if chat_format:
+        named = _named_formatter(chat_format)
+        if named is not None:
+            return named, f"chat_format={chat_format!r}"
+        raise RuntimeError(
+            f"model.llamacpp.chat_format={chat_format!r} matches no formatter in "
+            "llama_cpp.llama_chat_format. Use a name that does, or load a GGUF "
+            "that carries its own tokenizer.chat_template.")
+
+    raise RuntimeError(
+        "cannot reconstruct this model's chat prompt: its chat handler exposes no "
+        "to_chat_completion_prompt and the GGUF carries no tokenizer.chat_template. "
+        "teacher_force must rebuild exactly the string create_chat_completion used, "
+        "so guessing a template would compute every token statistic under the wrong "
+        "context. Set model.llamacpp.chat_format to the format this model was "
+        "trained with.")
+
+
 class LlamaCppLM:
     """Sampling + exact token statistics from a GGUF model."""
 
@@ -87,23 +162,23 @@ class LlamaCppLM:
         else:
             raise ValueError("llamacpp backend needs model_path, or repo_id + filename")
 
+        # Resolved eagerly: an unrenderable prompt must surface now, not after
+        # the first hours of generation.
+        self._format_prompt, self.prompt_template_source = resolve_chat_formatter(
+            self._llm, chat_format=cfg.chat_format)
+
     # -- prompt handling ---------------------------------------------------
     def _render(self, messages: Sequence[dict]) -> str:
-        """Apply the GGUF's own chat template.
+        """Apply the loaded model's own chat template.
 
-        Going through the model's template rather than hand-concatenating keeps
-        the prompt identical between the sampling pass and the teacher-forced
-        clean-prompt pass, which is the only way the two h_tok columns are
-        comparable.
+        ``create_chat_completion`` formats the messages internally and
+        ``teacher_force`` has to reconstruct EXACTLY that string: a different
+        prompt is different conditioning, so every h_tok, logp_mean and
+        min_token_p would describe a context the answer was never produced in.
+        The formatter is resolved once at construction by
+        :func:`resolve_chat_formatter`, which refuses to guess.
         """
-        handler = self._llm.chat_handler or getattr(self._llm, "_chat_handler", None)
-        fmt = getattr(handler, "to_chat_completion_prompt", None)
-        if fmt is not None:  # pragma: no cover - depends on binding version
-            return fmt(list(messages))
-        from llama_cpp.llama_chat_format import format_llama3  # type: ignore
-        with contextlib.suppress(Exception):
-            return format_llama3(messages=list(messages)).prompt
-        return "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        return self._format_prompt(list(messages))
 
     def _tokenize(self, text: str, *, add_bos: bool) -> list[int]:
         return self._llm.tokenize(text.encode("utf-8"), add_bos=add_bos, special=True)
@@ -146,12 +221,15 @@ class LlamaCppLM:
 
         self._llm.reset()
         self._llm.eval(prompt_ids + cont_ids)
-        scores = np.asarray(self._llm.scores, dtype=np.float64)
         n_eval = len(prompt_ids) + len(cont_ids)
         # Position i predicts token i+1, so the distribution scoring the first
         # continuation token sits at index len(prompt_ids) - 1.
         start = len(prompt_ids) - 1
-        rows = scores[start:n_eval - 1]
+        # Slice BEFORE converting dtype. ``scores`` is [n_ctx, n_vocab] float32:
+        # 2.1 GB at n_ctx=4096 for Llama-3.1's 128k vocabulary. Converting the
+        # whole buffer to float64 would allocate 4.2 GB on EVERY draw in order
+        # to read a few dozen rows, and there are two such passes per draw.
+        rows = np.asarray(self._llm.scores[start:n_eval - 1], dtype=np.float64)
         if rows.shape[0] != len(cont_ids):  # pragma: no cover - binding drift
             raise RuntimeError(
                 f"expected {len(cont_ids)} logit rows, got {rows.shape[0]}; "
@@ -208,8 +286,27 @@ class LlamaCppNLI:
         self.name = f"{lm.name}-nli"
         self.max_tokens = max_tokens
         self.seed = seed
+        self.n_calls = 0
+        self.n_unparsed = 0
 
     def entailment_prob(self, premise: str, hypothesis: str) -> float:
+        """P(premise entails hypothesis), from a three-way verdict.
+
+        The judge emits a LABEL, not a distribution, so the only honest mapping
+        is 1.0 for entailment and 0.0 for the two non-entailment labels. An
+        earlier version returned 0.5 for neutral, which was worse than merely
+        vague: ``cluster.cluster_answers`` merges when ``min(fwd, bwd) >=
+        nli.entail_threshold`` and that threshold is 0.5, so every neutral
+        verdict silently merged two distinct answers into one cluster --
+        deflating H_sem and inflating largest_cluster_share, which are exactly
+        the quantities the diversity 2x2 (6.6) and the semantic-entropy baseline
+        are built from.
+
+        Unparseable output is a failure, not a verdict. It scores 0.0 -- the
+        conservative direction, since refusing to merge leaves the answers
+        distinguishable -- and is counted so the rate can be reported rather
+        than absorbed.
+        """
         from ..prompts import build_nli
         # Greedy and unrestricted: an entailment verdict must not vary run to run.
         gen = self.lm.generate(
@@ -217,8 +314,16 @@ class LlamaCppNLI:
             params=SamplingParams(temperature=0.0, max_tokens=self.max_tokens),
             seed=self.seed)
         text = gen.text.strip().lower()
+        self.n_calls += 1
         if text.startswith("entail"):
             return 1.0
-        if text.startswith("contradict"):
+        if text.startswith("contradict") or text.startswith("neutral"):
             return 0.0
-        return 0.5
+        self.n_unparsed += 1
+        return 0.0
+
+    def audit(self) -> dict[str, float | int]:
+        """Verdict-parse failure rate, reported alongside the clustering."""
+        return {"judge": self.name, "n_calls": self.n_calls,
+                "n_unparsed": self.n_unparsed,
+                "unparsed_rate": (self.n_unparsed / self.n_calls) if self.n_calls else 0.0}

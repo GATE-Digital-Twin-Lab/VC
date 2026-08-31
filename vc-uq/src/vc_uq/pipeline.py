@@ -203,6 +203,16 @@ def step4_survival(state: PipelineState) -> PipelineState:
     nli = build_nli(cfg)
     answers = cluster.cluster_frame(cfg, answers, nli=nli)
     state.answers = answers
+    # A prompted judge can emit something that is not one of the three labels.
+    # That is a parse failure like any other and is reported, not absorbed.
+    if hasattr(nli, "audit"):
+        audit = nli.audit()
+        store.write_json("nli_audit", audit)
+        if audit.get("unparsed_rate", 0.0) > 0.01:
+            state.notes.append(
+                f"NLI judge returned an unrecognised verdict on "
+                f"{audit['unparsed_rate']:.1%} of comparisons; clustering treated "
+                "those as 'not the same answer'.")
 
     qs = survival.question_stats(answers)
     div = cluster.question_diversity(answers)

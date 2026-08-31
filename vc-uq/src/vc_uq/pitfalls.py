@@ -62,6 +62,17 @@ class PitfallReport:
         }
 
 
+def _has(df: pd.DataFrame | None, *cols: str) -> bool:
+    """True when ``df`` is populated and carries every named column.
+
+    Checks state their inputs rather than assuming them: ``run_checks`` is given
+    whatever artifacts exist at the time, and a check that raises on a missing
+    column turns the pitfall report -- the thing you read to find out whether to
+    believe the run -- into a crash.
+    """
+    return df is not None and len(df) > 0 and all(c in df.columns for c in cols)
+
+
 def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
                questions: pd.DataFrame | None = None,
                km: pd.DataFrame | None = None, beta: float | None = None,
@@ -111,7 +122,7 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
           "coverage marginalises over that randomness too.")
 
     # -- splits by question --
-    if answers is not None and len(answers):
+    if _has(answers, "q_id", "split"):
         per_q = answers.groupby("q_id")["split"].nunique()
         r.add("splits are by question, not by draw", bool((per_q <= 1).all()), "fatal",
               f"{int((per_q > 1).sum())} q_ids span multiple splits")
@@ -143,7 +154,7 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
               "table by arithmetic, which is a statement about the floor, not about VC.")
 
     # -- classify / calib disjointness --
-    if answers is not None and len(answers):
+    if _has(answers, "q_id", "draw_idx", "split"):
         cls = set(map(tuple, answers.loc[answers["split"] == "classify",
                                          ["q_id", "draw_idx"]].to_numpy().tolist()))
         cal = set(map(tuple, answers.loc[answers["split"] == "calib",
@@ -154,7 +165,7 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
               "being certified.")
 
     # -- tau selected on its own split --
-    if answers is not None and len(answers):
+    if _has(answers, "split"):
         has_tau_split = "tau_select" in set(answers["split"])
         r.add("tau is selected on a split reserved for it", has_tau_split, "fatal",
               "tau_select must exist and must not be reused for LTT")
@@ -241,6 +252,31 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
     r.add("vc_pre is elicited with no answer in context",
           prompts.get(pre_variant).kind == "pre", "fatal",
           f"{pre_variant!r} must be a pre-hoc prompt")
+
+    # -- a whitespace-only stop sequence truncates the elicitation format --
+    stops = list(cfg.get("model.generation.stop") or ())
+    blank_stops = [s for s in stops if s.strip() == ""]
+    r.add("no stop sequence can cut the reply in half",
+          not blank_stops, "fatal",
+          f"model.generation.stop contains {blank_stops!r}. The elicitation format "
+          "spans two lines and models routinely separate them with a blank line, so "
+          "generation would halt before the confidence field exists. The parser is "
+          "layout-agnostic but cannot recover tokens that were never emitted."
+          if blank_stops else f"stop={stops!r} are all end-of-turn markers")
+
+    # -- VC actually parsed off the draws --
+    if _has(answers, "vc_post"):
+        rate = float(answers["vc_post"].isna().mean())
+        limit = float(cfg.get("generation.max_vc_parse_failure_rate"))
+        worst = ""
+        if "parse_status" in answers.columns and rate > 0:
+            counts = answers.loc[answers["vc_post"].isna(), "parse_status"].value_counts()
+            worst = f" Most common status: {counts.index[0]!r} ({int(counts.iloc[0])} rows)."
+        r.add("verbalised confidence parsed off the draws",
+              rate <= limit, "fatal",
+              f"vc_post is null on {rate:.1%} of answers (limit {limit:.0%}).{worst} "
+              "Elicitation is the measurement; below this the tables are empty rather "
+              "than negative.")
 
     # -- every config-named prompt variant actually exists --
     unknown = prompts.unknown_config_variants(cfg)

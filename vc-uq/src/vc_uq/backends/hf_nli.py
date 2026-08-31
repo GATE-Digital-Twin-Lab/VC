@@ -18,7 +18,7 @@ class HFNLI:
     def __init__(self, name: str = "microsoft/deberta-v3-large-mnli",
                  batch_size: int = 16, device: str = "cuda"):
         try:
-            import torch  # noqa: F401
+            import torch
             from transformers import (AutoModelForSequenceClassification,
                                       AutoTokenizer)
         except ImportError as exc:  # pragma: no cover - environment dependent
@@ -26,7 +26,6 @@ class HFNLI:
                 "transformers + torch are required for the hf NLI backend; "
                 "use nli.backend: llm to route entailment through llama.cpp instead."
             ) from exc
-        import torch
 
         self.name = name
         self.batch_size = batch_size
@@ -62,15 +61,18 @@ class HFNLI:
 class STEmbedder:
     """sentence-transformers embeddings, as an alternative to the GGUF path."""
 
-    def __init__(self, name: str = "sentence-transformers/all-mpnet-base-v2"):
+    def __init__(self, name: str = "sentence-transformers/all-mpnet-base-v2",
+                 batch_size: int = 32):
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:  # pragma: no cover
             raise ImportError("sentence-transformers is not installed") from exc
         self.name = name
+        self.batch_size = batch_size
         self._model = SentenceTransformer(name)
         self.dim = int(self._model.get_sentence_embedding_dimension())
 
     def embed(self, texts: Sequence[str]) -> np.ndarray:
-        return np.asarray(self._model.encode(list(texts), convert_to_numpy=True),
+        return np.asarray(self._model.encode(list(texts), convert_to_numpy=True,
+                                             batch_size=self.batch_size),
                           dtype=np.float64)

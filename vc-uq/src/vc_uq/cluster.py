@@ -20,6 +20,49 @@ from .backends import build_nli
 from .config import Config
 
 
+def _match_pairwise(ans: str, reps: list[str], nli, threshold: float) -> int | None:
+    """One judge call per direction per representative, short-circuiting."""
+    for cid, rep in enumerate(reps):
+        if ans == rep:
+            return cid
+        fwd = nli.entailment_prob(rep, ans)
+        bwd = nli.entailment_prob(ans, rep)
+        if min(fwd, bwd) >= threshold:
+            return cid
+    return None
+
+
+def _match_batched(ans: str, reps: list[str], batch, threshold: float) -> int | None:
+    """Both directions against every representative in a single judge call.
+
+    Returns exactly what :func:`_match_pairwise` returns -- the FIRST
+    representative that either matches exactly or clears the threshold in both
+    directions -- so the greedy assignment is unchanged. What changes is the
+    call pattern: an encoder head run at batch size 1 wastes almost all of a
+    GPU, and clustering makes on the order of half a million comparisons across
+    the corpus.
+
+    The trade is deliberate. This scores every representative instead of
+    stopping at the first hit, so it runs MORE forward passes in far fewer
+    calls. On an accelerator that is a large net win, because a batch of 2k
+    costs about what a batch of 1 costs.
+    """
+    exact = {i for i, rep in enumerate(reps) if ans == rep}
+    todo = [i for i in range(len(reps)) if i not in exact]
+    scores: dict[int, float] = {}
+    if todo:
+        premises = [reps[i] for i in todo] + [ans] * len(todo)
+        hypotheses = [ans] * len(todo) + [reps[i] for i in todo]
+        probs = list(batch(premises, hypotheses))
+        n = len(todo)
+        for k, i in enumerate(todo):
+            scores[i] = min(float(probs[k]), float(probs[n + k]))
+    for cid in range(len(reps)):
+        if cid in exact or scores.get(cid, -1.0) >= threshold:
+            return cid
+    return None
+
+
 def cluster_answers(answers: list[str], nli, threshold: float = 0.5) -> list[int]:
     """Greedy bidirectional-entailment clustering, in draw order.
 
@@ -28,25 +71,22 @@ def cluster_answers(answers: list[str], nli, threshold: float = 0.5) -> list[int
     against one representative per cluster, which keeps this O(n * n_clusters)
     rather than O(n^2) -- the difference matters at 40 draws x thousands of
     questions with an encoder in the loop.
+
+    The outer loop cannot be batched: each assignment depends on the clusters
+    the previous answers created. The INNER loop can be, and a judge exposing
+    ``entailment_probs`` takes that path. Both paths produce the same
+    assignment; a test pins that.
     """
+    batch = getattr(nli, "entailment_probs", None)
     reps: list[str] = []
     assignment: list[int] = []
     for ans in answers:
-        placed = False
-        for cid, rep in enumerate(reps):
-            if ans == rep:
-                assignment.append(cid)
-                placed = True
-                break
-            fwd = nli.entailment_prob(rep, ans)
-            bwd = nli.entailment_prob(ans, rep)
-            if min(fwd, bwd) >= threshold:
-                assignment.append(cid)
-                placed = True
-                break
-        if not placed:
+        cid = (_match_batched(ans, reps, batch, threshold) if batch is not None
+               else _match_pairwise(ans, reps, nli, threshold))
+        if cid is None:
             reps.append(ans)
-            assignment.append(len(reps) - 1)
+            cid = len(reps) - 1
+        assignment.append(cid)
     return assignment
 
 

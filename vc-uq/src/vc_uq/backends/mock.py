@@ -107,8 +107,8 @@ class MockWorld:
         extra = self.diversity_temp_sensitivity * max(0.0, temperature - self.t_ref)
         return int(max(1, round(base * (1.0 + extra))))
 
-    def vc_level(self, q_id: str, dataset: str, prompt_variant: str = "vc_post_v1",
-                 scale: str = "unit") -> float:
+    def vc_level(self, q_id: str, dataset: str,
+                 prompt_variant: str = "vc_post_v1") -> float:
         """VC has no argument for temperature -- that is the point of 8.1."""
         p0 = self.baseline_p(q_id, dataset)
         noise = _u01(self.world_seed, "vc", q_id)
@@ -128,9 +128,11 @@ class MockLM:
 
     name = "mock-lm"
 
-    def __init__(self, world: MockWorld | None = None, vocab_size: int = 32000):
+    def __init__(self, world: MockWorld | None = None):
         self.world = world or MockWorld()
-        self.vocab_size = vocab_size
+        #: The decoder the last call actually ran with. Recorded so a test can
+        #: assert the truncation knobs were threaded through; see 8.1.
+        self.last_params: SamplingParams | None = None
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -168,15 +170,15 @@ class MockLM:
     def generate(self, messages: Sequence[dict], *, params: SamplingParams,
                  seed: int) -> Generation:
         temperature, max_tokens = params.temperature, params.max_tokens
-        # The simulated world responds to T only. Truncation knobs are recorded
-        # so a test can assert they were threaded through, but they do not shape
-        # the mock distribution -- pretending otherwise would invent an effect.
+        # The simulated world responds to T only. The truncation knobs are
+        # recorded so a test can assert they were threaded through, but they do
+        # not shape the mock distribution -- pretending otherwise would invent
+        # an effect that the real backend would then have to reproduce.
         self.last_params = params
         meta = self._meta(messages)
         q_id = meta.get("qid", self._field(messages, "Question") or "q?")
         dataset = meta.get("ds", "unknown")
         variant = meta.get("variant", "vc_post_v1")
-        scale = meta.get("scale", "unit")
         kind = meta.get("kind", "post")
         w = self.world
         rng = _rng(w.world_seed, "draw", q_id, seed, temperature, variant)
@@ -199,7 +201,7 @@ class MockLM:
 
         answer = self._answer_text(q_id, dataset, is_correct, mode)
 
-        vc = w.vc_level(q_id, dataset, variant, scale)
+        vc = w.vc_level(q_id, dataset, variant)
         if w.vc_reads_answer > 0:
             wrong_v, right_v = w.vc_answer_signal
             answer_signal = right_v if is_correct else wrong_v
@@ -208,7 +210,7 @@ class MockLM:
             vc = float(np.clip(vc + rng.normal(0.0, w.vc_within_sd), 0.0, 1.0))
         vc = w.quantise_vc(vc)
 
-        text = f"Answer: {answer}\nConfidence: {self._render_vc(vc, scale)}"
+        text = f"Answer: {answer}\nConfidence: {vc:g}"
         stats = self._token_stats(max(4, min(max_tokens, 24)),
                                   concentration=concentration,
                                   key=f"{q_id}:{seed}:{temperature}:{variant}")
@@ -224,18 +226,6 @@ class MockLM:
         value = w.quantise_vc(value)
         stats = self._token_stats(6, concentration=0.7, key=f"pre:{q_id}:{seed}")
         return Generation(text=f"Confidence: {value:g}", stats=stats)
-
-    @staticmethod
-    def _render_vc(vc: float, scale: str) -> str:
-        if scale == "percent":
-            return f"{vc * 100:g}%"
-        if scale == "outof10":
-            return f"{int(round(vc * 10))}"
-        if scale == "verbal":
-            from ..parsing import VERBAL_SCALE
-            label = min(VERBAL_SCALE, key=lambda k: abs(VERBAL_SCALE[k] - vc))
-            return label
-        return f"{vc:g}"
 
     def teacher_force(self, messages: Sequence[dict], continuation: str) -> TokenStats:
         meta = self._meta(messages)

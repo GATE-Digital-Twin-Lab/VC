@@ -899,3 +899,469 @@ def test_paraphrase_variants_differ_only_in_wording():
     assert len({tuple(x["role"] for x in m) for m in built}) == 1
     assert len({m[1]["content"] for m in built}) == 1, "the user turn must be identical"
     assert len({m[0]["content"] for m in built}) == 10, "systems must all differ"
+
+
+# --------------------------------------------------------------------------
+# llama.cpp backend
+#
+# llama-cpp-python is not installed here (and will not be on a 4 GB laptop),
+# so these exercise the parts that are pure Python: the entailment verdict
+# mapping and the teacher-forcing index arithmetic. Both are reached with
+# duck-typed stand-ins; neither imports llama_cpp.
+# --------------------------------------------------------------------------
+
+class _ScriptedLM:
+    """Returns a fixed verdict string, whatever it is asked."""
+
+    name = "scripted"
+
+    def __init__(self, verdict):
+        self.verdict = verdict
+        self.calls = 0
+
+    def generate(self, messages, *, params, seed):
+        from vc_uq.backends.base import Generation, TokenStats
+        self.calls += 1
+        empty = np.zeros(0)
+        return Generation(text=self.verdict,
+                          stats=TokenStats(empty, empty, empty))
+
+
+def test_neutral_verdict_does_not_merge_two_answers():
+    """A three-way judge emits a LABEL; only "entailment" is entailment.
+
+    Returning 0.5 for neutral was worse than vague: clustering merges when
+    min(fwd, bwd) >= nli.entail_threshold, and that threshold is 0.5, so every
+    neutral verdict merged two distinct answers -- deflating H_sem and inflating
+    largest_cluster_share, the two quantities the diversity 2x2 is built from.
+    """
+    from vc_uq.backends.llamacpp import LlamaCppNLI
+    from vc_uq.cluster import cluster_answers
+
+    for verdict, expected in [("entailment", 1.0), ("neutral", 0.0),
+                              ("contradiction", 0.0), ("Entailment.", 1.0)]:
+        judge = LlamaCppNLI(_ScriptedLM(verdict))
+        assert judge.entailment_prob("a", "b") == expected, verdict
+
+    neutral = LlamaCppNLI(_ScriptedLM("neutral"))
+    ids = cluster_answers(["Lisbon", "Madrid", "Oslo"], neutral, threshold=0.5)
+    assert ids == [0, 1, 2], "neutral verdicts must not collapse distinct answers"
+
+    entailing = LlamaCppNLI(_ScriptedLM("entailment"))
+    assert cluster_answers(["Lisbon", "Lisboa"], entailing, threshold=0.5) == [0, 0]
+
+
+def test_unrecognised_verdict_is_counted_not_absorbed():
+    """Judge parse failure is a reported rate, like VC parse failure."""
+    from vc_uq.backends.llamacpp import LlamaCppNLI
+
+    judge = LlamaCppNLI(_ScriptedLM("I am not sure about that one"))
+    assert judge.entailment_prob("a", "b") == 0.0
+    judge.entailment_prob("c", "d")
+    assert judge.audit() == {"judge": "scripted-nli", "n_calls": 2,
+                             "n_unparsed": 2, "unparsed_rate": 1.0}
+
+    clean = LlamaCppNLI(_ScriptedLM("entailment"))
+    clean.entailment_prob("a", "b")
+    assert clean.audit()["unparsed_rate"] == 0.0
+
+
+class _RefusesWholeBufferConversion:
+    """Stands in for llama.cpp's [n_ctx, n_vocab] score buffer.
+
+    Slicing works; converting the whole thing does not. At n_ctx=4096 and a
+    128k vocabulary that buffer is 2.1 GB of float32, so a float64 conversion
+    of all of it costs 4.2 GB per call -- twice per draw, tens of thousands of
+    draws -- to read a few dozen rows.
+    """
+
+    def __init__(self, arr):
+        self._arr = arr
+
+    def __getitem__(self, key):
+        return self._arr[key]
+
+    def __array__(self, *a, **k):
+        raise AssertionError("whole scores buffer converted; slice it first")
+
+
+class _FakeLlama:
+    def __init__(self, scores, prompt_len, cont_ids):
+        self.scores = _RefusesWholeBufferConversion(scores)
+        self._prompt_len = prompt_len
+        self._cont_ids = cont_ids
+        self.evaluated = None
+        self.chat_handler = type("H", (), {
+            "to_chat_completion_prompt": staticmethod(lambda m: "PROMPT")})()
+
+    def tokenize(self, text, add_bos=False, special=False):
+        return list(range(self._prompt_len)) if add_bos else list(self._cont_ids)
+
+    def reset(self):
+        pass
+
+    def eval(self, ids):
+        self.evaluated = list(ids)
+
+
+def test_teacher_force_reads_only_the_rows_it_needs():
+    """Index arithmetic and buffer handling, without llama-cpp-python.
+
+    Position i predicts token i+1, so the row scoring the first continuation
+    token is at len(prompt_ids) - 1. Getting this off by one would silently
+    attribute each token's entropy to its neighbour.
+    """
+    from vc_uq.backends.llamacpp import LlamaCppLM, resolve_chat_formatter
+
+    rng = np.random.default_rng(0)
+    n_ctx, vocab, prompt_len = 16, 8, 5
+    cont_ids = [2, 5, 1]
+    scores = rng.normal(size=(n_ctx, vocab)).astype(np.float32)
+
+    lm = object.__new__(LlamaCppLM)          # no GGUF, no llama_cpp import
+    lm._llm = _FakeLlama(scores, prompt_len, cont_ids)
+    lm._format_prompt, _ = resolve_chat_formatter(lm._llm)
+
+    stats = lm.teacher_force([{"role": "user", "content": "q"}], "irrelevant")
+
+    assert lm._llm.evaluated == list(range(prompt_len)) + cont_ids
+    assert stats.n_tokens == len(cont_ids)
+
+    # Rows 4, 5, 6 score continuation tokens 0, 1, 2.
+    for i, tok in enumerate(cont_ids):
+        z = scores[prompt_len - 1 + i].astype(np.float64)
+        p = np.exp(z - z.max())
+        p /= p.sum()
+        assert stats.entropies[i] == pytest.approx(float(-(p * np.log(p)).sum()))
+        assert stats.chosen_probs[i] == pytest.approx(float(p[tok]))
+        assert stats.logprobs[i] == pytest.approx(float(np.log(p[tok])))
+
+
+def test_teacher_force_on_an_empty_continuation_is_empty_not_zero():
+    from vc_uq.backends.llamacpp import LlamaCppLM, resolve_chat_formatter
+
+    lm = object.__new__(LlamaCppLM)
+    lm._llm = _FakeLlama(np.zeros((4, 3), dtype=np.float32), 2, [])
+    lm._format_prompt, _ = resolve_chat_formatter(lm._llm)
+    stats = lm.teacher_force([{"role": "user", "content": "q"}], "")
+    assert stats.n_tokens == 0
+    assert stats.summary()["h_tok_mean"] is None
+
+
+# --------------------------------------------------------------------------
+# Chat-template resolution
+#
+# teacher_force must rebuild exactly the string create_chat_completion used.
+# Guessing produces a complete run whose every token statistic describes the
+# wrong context -- and since the token-entropy family is what VC is compared
+# against, a degraded baseline flatters VC. So the resolver refuses to guess.
+# --------------------------------------------------------------------------
+
+class _Llm:
+    """Minimal stand-in: only what resolve_chat_formatter inspects."""
+
+    def __init__(self, *, handler=None, template=None):
+        if handler is not None:
+            self.chat_handler = handler
+        else:
+            self.chat_handler = None
+        self.metadata = {"tokenizer.chat_template": template} if template else {}
+
+    def token_bos(self):
+        return 1
+
+    def token_eos(self):
+        return 2
+
+    def detokenize(self, ids):
+        return b"<bos>" if ids == [1] else b"<eos>"
+
+
+def test_formatter_prefers_the_models_own_handler():
+    from vc_uq.backends.llamacpp import resolve_chat_formatter
+
+    handler = type("H", (), {
+        "to_chat_completion_prompt": staticmethod(lambda m: "FROM HANDLER")})()
+    render, source = resolve_chat_formatter(
+        _Llm(handler=handler, template="{{ 'FROM TEMPLATE' }}"))
+
+    assert render([{"role": "user", "content": "q"}]) == "FROM HANDLER"
+    assert source == "chat_handler.to_chat_completion_prompt"
+
+
+def test_formatter_falls_back_to_the_gguf_own_template(monkeypatch):
+    """Model-agnostic: the GGUF carries the template it was trained with.
+
+    The previous implementation hardcoded format_llama3 here, which is right by
+    coincidence for a Llama GGUF and wrong for every other model.
+    """
+    from vc_uq.backends import llamacpp
+
+    seen = {}
+
+    def fake_jinja(template, *, bos_token, eos_token):
+        seen.update(template=template, bos=bos_token, eos=eos_token)
+        return lambda msgs: f"RENDERED[{template}]"
+
+    monkeypatch.setattr(llamacpp, "_jinja_formatter", fake_jinja)
+    render, source = llamacpp.resolve_chat_formatter(_Llm(template="QWEN-TEMPLATE"))
+
+    assert render([]) == "RENDERED[QWEN-TEMPLATE]"
+    assert source == "gguf tokenizer.chat_template"
+    assert seen == {"template": "QWEN-TEMPLATE", "bos": "<bos>", "eos": "<eos>"}
+
+
+def test_formatter_refuses_to_guess(monkeypatch):
+    """No handler, no template, no configured format -> stop, do not improvise."""
+    from vc_uq.backends import llamacpp
+
+    with pytest.raises(RuntimeError, match="cannot reconstruct"):
+        llamacpp.resolve_chat_formatter(_Llm())
+
+    # An explicit chat_format that matches nothing is also a refusal, not a guess.
+    monkeypatch.setattr(llamacpp, "_named_formatter", lambda name: None)
+    with pytest.raises(RuntimeError, match="matches no formatter"):
+        llamacpp.resolve_chat_formatter(_Llm(), chat_format="not-a-real-format")
+
+
+def test_configured_chat_format_is_used_when_the_gguf_has_no_template(monkeypatch):
+    from vc_uq.backends import llamacpp
+
+    monkeypatch.setattr(llamacpp, "_named_formatter",
+                        lambda name: (lambda msgs: f"NAMED[{name}]"))
+    render, source = llamacpp.resolve_chat_formatter(_Llm(), chat_format="chatml")
+    assert render([]) == "NAMED[chatml]"
+    assert source == "chat_format='chatml'"
+
+
+# --------------------------------------------------------------------------
+# Batched entailment
+#
+# An encoder head at batch size 1 wastes almost all of a GPU, and clustering
+# makes on the order of half a million comparisons across the corpus. The
+# batched path exists for that -- but it must not change a single cluster
+# assignment, because H_sem and largest_cluster_share are built from them.
+# --------------------------------------------------------------------------
+
+class _PairJudge:
+    """Deterministic judge exposing only the one-pair API."""
+
+    def __init__(self, table, default=0.0):
+        self.table = table
+        self.default = default
+        self.calls = 0
+
+    def entailment_prob(self, premise, hypothesis):
+        self.calls += 1
+        return self.table.get((premise, hypothesis), self.default)
+
+
+class _BatchJudge(_PairJudge):
+    """The same judge, plus the batched API HFNLI exposes."""
+
+    def __init__(self, table, default=0.0):
+        super().__init__(table, default)
+        self.batches = 0
+        self.batch_sizes = []
+
+    def entailment_probs(self, premises, hypotheses):
+        self.batches += 1
+        self.batch_sizes.append(len(premises))
+        return np.array([self.table.get(pair, self.default)
+                         for pair in zip(premises, hypotheses)])
+
+
+def _symmetric(pairs, value=0.9):
+    """Entailment in BOTH directions -- the only thing that merges clusters."""
+    table = {}
+    for a, b in pairs:
+        table[(a, b)] = value
+        table[(b, a)] = value
+    return table
+
+
+def test_batched_and_pairwise_clustering_agree():
+    from vc_uq.cluster import cluster_answers
+
+    answers = ["Lisbon", "Lisboa", "Madrid", "Lisbon", "Oslo", "Madrid city",
+               "Lisboa", "Reykjavik"]
+    table = _symmetric([("Lisbon", "Lisboa"), ("Madrid", "Madrid city")])
+
+    pair = cluster_answers(answers, _PairJudge(table), threshold=0.5)
+    batched = cluster_answers(answers, _BatchJudge(table), threshold=0.5)
+
+    assert pair == batched == [0, 0, 1, 0, 2, 1, 0, 3]
+
+
+def test_batched_path_keeps_first_qualifying_rep_when_several_qualify():
+    """Entailment is not transitive, so more than one cluster can qualify.
+
+    "the capital of Portugal" and "Lisboa" need not entail each other, yet both
+    can entail "Lisbon" in both directions. The pairwise path short-circuits and
+    takes the first; the batched path scores every representative before
+    choosing, so it must scan in index order rather than taking the strongest
+    match. Picking argmax instead would reassign answers between clusters and
+    move n_clusters, H_sem and largest_cluster_share.
+    """
+    from vc_uq.cluster import cluster_answers
+
+    table = _symmetric([("the capital of Portugal", "Lisbon"), ("Lisboa", "Lisbon")])
+    table[("the capital of Portugal", "Lisboa")] = 0.02   # not each other
+    table[("Lisboa", "the capital of Portugal")] = 0.02
+    # Make the LATER representative the stronger match, so argmax would pick it.
+    table[("Lisboa", "Lisbon")] = 0.99
+    table[("Lisbon", "Lisboa")] = 0.99
+    table[("the capital of Portugal", "Lisbon")] = 0.60
+    table[("Lisbon", "the capital of Portugal")] = 0.60
+
+    answers = ["the capital of Portugal", "Lisboa", "Lisbon"]
+    pair = cluster_answers(answers, _PairJudge(table), threshold=0.5)
+    batched = cluster_answers(answers, _BatchJudge(table), threshold=0.5)
+
+    assert pair == [0, 1, 0], "the pairwise path takes the first qualifying rep"
+    assert batched == pair, "the batched path must not prefer the stronger match"
+
+
+def test_one_sided_entailment_does_not_merge_in_either_path():
+    """Bidirectional is the whole point: "Paris" implies "a city in France",
+    not the reverse, and merging on the one-way relation would collapse a
+    specific answer into a vague one."""
+    from vc_uq.cluster import cluster_answers
+
+    table = {("Paris", "a city in France"): 0.99,
+             ("a city in France", "Paris"): 0.05}
+    answers = ["Paris", "a city in France"]
+
+    assert cluster_answers(answers, _PairJudge(table), threshold=0.5) == [0, 1]
+    assert cluster_answers(answers, _BatchJudge(table), threshold=0.5) == [0, 1]
+
+
+def test_batched_path_collapses_the_call_count():
+    """One judge call per answer instead of up to two per representative."""
+    from vc_uq.cluster import cluster_answers
+
+    answers = [f"answer {i}" for i in range(12)]     # all distinct, no merging
+    table = {}
+
+    pair = _PairJudge(table)
+    cluster_answers(answers, pair, threshold=0.5)
+
+    batch = _BatchJudge(table)
+    cluster_answers(answers, batch, threshold=0.5)
+
+    # 12 answers, no merges: the pairwise path makes 2 calls per existing
+    # representative, the batched path one call per answer that has any.
+    assert pair.calls == 2 * sum(range(12))
+    assert batch.batches == 11
+    assert batch.calls == 0, "the batched path must not fall back per pair"
+    # Each batch carries both directions for every current representative.
+    assert batch.batch_sizes == [2 * i for i in range(1, 12)]
+
+
+def test_cluster_frame_uses_whichever_api_the_judge_offers(cfg):
+    """cluster_frame must not care which judge it was handed."""
+    import pandas as pd
+
+    from vc_uq.cluster import cluster_frame
+
+    rows = [{"q_id": "q0", "draw_idx": i, "answer": a}
+            for i, a in enumerate(["Lisbon", "Lisboa", "Madrid"])]
+    df = pd.DataFrame(rows)
+    table = _symmetric([("Lisbon", "Lisboa")])
+
+    a = cluster_frame(cfg, df, nli=_PairJudge(table))
+    b = cluster_frame(cfg, df, nli=_BatchJudge(table))
+    assert list(a["cluster_id"]) == list(b["cluster_id"]) == [0, 0, 1]
+    assert list(a["f"]) == list(b["f"])
+
+
+# --------------------------------------------------------------------------
+# Elicitation robustness
+#
+# Two different failures are easy to confuse. The PARSER locates fields by
+# name, so preamble, blank lines, markdown and trailing chatter are all
+# harmless. The STOP SEQUENCE is upstream of the parser: it can halt generation
+# before the confidence field is ever emitted, and no regex recovers that.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "Answer: Lisbon\nConfidence: 0.9",
+    "Answer: Lisbon\n\n\n\nConfidence: 0.9",
+    "Sure! Happy to help.\n\nAnswer: Lisbon\n\nConfidence: 0.9",
+    "Answer: Lisbon\nConfidence: 0.9\n\nLet me know if you need anything else.",
+    "Confidence: 0.9\nAnswer: Lisbon",
+    "**Answer:** Lisbon\n**Confidence:** 0.9",
+    "**Answer:** **Lisbon**\n\n**Confidence:** 0.9",
+    "- Answer: Lisbon\n- Confidence: 0.9",
+    "### Answer: Lisbon\n### Confidence: 0.9",
+    "> Answer: Lisbon\n> Confidence: 0.9",
+    "Answer - Lisbon\nConfidence - 0.9",
+    "  answer:   Lisbon  \n  CONFIDENCE:   0.9  ",
+])
+def test_fields_are_found_by_name_whatever_the_layout(text):
+    """Layout is the model's business; the fields are located by name."""
+    p = parse_answer_and_vc(text)
+    assert p.status == "ok", text
+    assert p.answer == "Lisbon", text
+    assert p.vc == pytest.approx(0.9)
+
+
+def test_markup_is_stripped_from_the_answer_text():
+    """The answer feeds e_cos against a_star, so stray asterisks are noise in
+    the correctness criterion, not cosmetic."""
+    assert parse_answer_and_vc("**Answer:** **Lisbon**\nConfidence: 0.9").answer == "Lisbon"
+    assert parse_answer_and_vc("- **Lisbon**\nConfidence: 0.9").answer == "Lisbon"
+    assert parse_answer_and_vc("Answer: `Lisbon`\nConfidence: 0.9").answer == "Lisbon"
+
+
+def test_truncated_generation_is_a_failure_the_parser_cannot_fix():
+    """What a stop sequence removes is gone before parsing begins."""
+    emitted = "Answer: Lisbon\n\nConfidence: 0.9"
+    assert parse_answer_and_vc(emitted).vc == pytest.approx(0.9)
+
+    truncated = emitted[:emitted.index("\n\n")]      # what a "\n\n" stop returns
+    p = parse_answer_and_vc(truncated)
+    assert p.answer == "Lisbon"
+    assert p.vc is None
+    assert p.status == NO_CONFIDENCE_FIELD
+
+
+def test_no_stop_sequence_can_cut_the_reply_in_half(cfg):
+    """The shipped config must not contain a whitespace-only stop."""
+    from vc_uq.pitfalls import run_checks
+
+    name = "no stop sequence can cut the reply in half"
+    assert not [s for s in cfg.get("model.generation.stop") if s.strip() == ""]
+    assert next(c for c in run_checks(cfg).checks if c.name == name).passed is True
+
+    bad = cfg.with_overrides(['model.generation.stop=["\n\n"]'])
+    check = next(c for c in run_checks(bad).checks if c.name == name)
+    assert check.passed is False and check.severity == "fatal"
+
+
+def test_vc_parse_failure_rate_is_fatal_above_the_limit(cfg):
+    """Elicitation IS the measurement; a run that cannot read VC has no result.
+
+    Without this the failure is silent: reliability() drops null rows, so Phase
+    2 would emit empty tables rather than an error.
+    """
+    import pandas as pd
+
+    from vc_uq.pitfalls import run_checks
+
+    name = "verbalised confidence parsed off the draws"
+
+    def frame(n_null, n_ok):
+        rows = [{"q_id": f"q{i}", "vc_post": None, "parse_status": "no_confidence_field"}
+                for i in range(n_null)]
+        rows += [{"q_id": f"q{i}", "vc_post": 0.8, "parse_status": "ok"}
+                 for i in range(n_null, n_null + n_ok)]
+        return pd.DataFrame(rows)
+
+    good = next(c for c in run_checks(cfg, answers=frame(1, 99)).checks if c.name == name)
+    assert good.passed is True
+
+    bad = next(c for c in run_checks(cfg, answers=frame(40, 60)).checks if c.name == name)
+    assert bad.passed is False and bad.severity == "fatal"
+    assert "40.0%" in bad.detail
+    assert "no_confidence_field" in bad.detail, "say WHICH failure dominates"

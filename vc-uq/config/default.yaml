@@ -51,7 +51,11 @@ model:
     tensor_split: null        # e.g. [0.5, 0.5] to split across the two 5090s
     flash_attn: true
     verbose: false
-    chat_format: null         # null = use the GGUF's own chat template
+    # null = use the GGUF's own tokenizer.chat_template, which is what
+    # create_chat_completion applies. Set this only when a GGUF carries no
+    # template: teacher forcing has to rebuild the prompt exactly, and the
+    # backend refuses to guess rather than compute h_tok under a wrong context.
+    chat_format: null
   generation:
     # The complete decoder specification. Every one of these is passed
     # EXPLICITLY on every call (backends/base.py SamplingParams), because
@@ -60,8 +64,15 @@ model:
     # decoder, so the 8.1 temperature sweep only measures T if T is the only
     # thing shaping the distribution. The values below are the unrestricted
     # decoder the protocol requires; a pitfall check fails if they are narrowed.
-    max_tokens: 128
-    stop: ["\n\n", "</s>", "<|eot_id|>"]
+    max_tokens: 256
+    # NO whitespace-only stop sequences. The elicitation format spans two lines
+    # and instruct models routinely put a blank line between them, so a "\n\n"
+    # stop halts generation BEFORE the confidence line exists -- on every draw,
+    # in a study about that number. The parser is layout-agnostic, but it cannot
+    # recover tokens that were never emitted. create_chat_completion already
+    # stops at the model's own end-of-turn token; these are belt and braces for
+    # models that emit the marker as text. A pitfall check enforces this.
+    stop: ["</s>", "<|eot_id|>", "<|im_end|>"]
     top_p: 1.0
     top_k: 0                  # 0 = disabled
     min_p: 0.0
@@ -83,6 +94,7 @@ embedding:
     n_gpu_layers: -1
   sentence_transformers:
     name: sentence-transformers/all-mpnet-base-v2
+    batch_size: 32          # STEmbedder.encode; nli.hf.batch_size is separate
   # Anisotropy correction (Phase 0 known failure mode). Applied to the whole
   # embedding matrix of a split before any cosine is taken.
   postprocess:
@@ -140,6 +152,10 @@ generation:
   prompt_variant_post: vc_post_v1
   prompt_variant_pre: vc_pre_v1
   prompt_variant_clean: answer_clean_v1   # no VC instruction; used for teacher-forced h_tok
+  # Elicitation is the measurement. If VC cannot be parsed off this share of
+  # draws the run is not a weak result, it is no result, and a pitfall check
+  # fails rather than letting Phase 2 dropna its way to an empty table.
+  max_vc_parse_failure_rate: 0.05
   token_stats:
     # Storing per-position entropies for all draws is large; keep summaries always
     # and full arrays for a subsample (protocol 4).
