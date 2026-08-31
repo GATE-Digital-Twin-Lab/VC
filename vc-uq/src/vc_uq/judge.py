@@ -114,7 +114,7 @@ def greedy_anchor(lm, cfg: Config, question_row: pd.Series) -> str:
     if cfg.get("model.backend") == "mock":
         msgs = _mock_meta(msgs, {"qid": question_row["q_id"],
                                  "ds": question_row["dataset"],
-                                 "variant": spec.variant, "scale": spec.scale,
+                                 "variant": spec.variant,
                                  "kind": "post"})
     from .backends.base import SamplingParams
     params = SamplingParams.from_config(
@@ -124,7 +124,7 @@ def greedy_anchor(lm, cfg: Config, question_row: pd.Series) -> str:
                       seed=derive_seed(int(cfg.get("run.seed")), "anchor",
                                        question_row["q_id"]))
     from .parsing import parse_answer_and_vc
-    return parse_answer_and_vc(gen.text, spec.scale).answer
+    return parse_answer_and_vc(gen.text).answer
 
 
 def build_anchors(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,

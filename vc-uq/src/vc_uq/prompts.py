@@ -18,26 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Literal
 
-Scale = Literal["unit", "percent", "verbal", "outof10"]
-
-#: Ordered ladder for verbal confidence, midpoints of ten equal bins. No prompt
-#: asks for a word -- every elicitation asks for a number in [0, 1] -- but models
-#: answer "fairly confident" anyway, and ``parsing`` maps such an answer onto the
-#: ladder rather than discarding it. Kept here with the other elicitation
-#: vocabulary. Insertion order is the ladder.
-VERBAL_SCALE: dict[str, float] = {
-    "impossible": 0.00,
-    "doubtful": 0.10,
-    "unlikely": 0.20,
-    "uncertain": 0.30,
-    "even": 0.50,
-    "likely": 0.65,
-    "probable": 0.75,
-    "confident": 0.85,
-    "highly confident": 0.95,
-    "certain": 1.00,
-}
-
 Message = dict[str, str]
 
 
@@ -45,7 +25,6 @@ Message = dict[str, str]
 class PromptSpec:
     variant: str
     kind: Literal["post", "pre", "clean", "nli"]
-    scale: Scale
     build: Callable[..., list[Message]]
     elicits_vc: bool = True
     notes: str = ""
@@ -191,7 +170,7 @@ def _post_builder(body: str) -> Callable[..., list[Message]]:
 
 
 for _variant, _body in _POST_BODIES.items():
-    register(PromptSpec(variant=_variant, kind="post", scale="unit",
+    register(PromptSpec(variant=_variant, kind="post",
                         build=_post_builder(_body)))
 
 
@@ -214,7 +193,7 @@ def _pre_build(question: str, **_: object) -> list[Message]:
     ]
 
 
-register(PromptSpec(variant="vc_pre_v1", kind="pre", scale="unit", build=_pre_build,
+register(PromptSpec(variant="vc_pre_v1", kind="pre", build=_pre_build,
                     notes="prospective feeling-of-knowing; no answer in context"))
 
 
@@ -233,7 +212,7 @@ def _clean_build(question: str, **_: object) -> list[Message]:
     ]
 
 
-register(PromptSpec(variant="answer_clean_v1", kind="clean", scale="unit",
+register(PromptSpec(variant="answer_clean_v1", kind="clean",
                     build=_clean_build, elicits_vc=False,
                     notes="no VC instruction; teacher-forcing target for clean h_tok"))
 
@@ -254,6 +233,6 @@ def build_nli(premise: str, hypothesis: str) -> list[Message]:
     ]
 
 
-register(PromptSpec(variant="nli_bidirectional_v1", kind="nli", scale="unit",
+register(PromptSpec(variant="nli_bidirectional_v1", kind="nli",
                     build=lambda premise, hypothesis, **_: build_nli(premise, hypothesis),
                     elicits_vc=False))

@@ -12,7 +12,7 @@ import pytest
 
 from vc_uq.config import ConfigError, load_config
 from vc_uq.judge import CircularityError, guard_against_circularity
-from vc_uq.parsing import (OK, NO_CONFIDENCE_FIELD, OUT_OF_RANGE,
+from vc_uq.parsing import (OK, NO_CONFIDENCE_FIELD, OUT_OF_RANGE, UNPARSEABLE_VALUE,
                            parse_answer_and_vc, parse_audit, parse_vc_only)
 from vc_uq.pitfalls import run_checks
 from vc_uq.prompts import get, variants
@@ -144,26 +144,61 @@ def test_parse_failure_returns_none_not_a_default():
     assert p.status == NO_CONFIDENCE_FIELD
 
 
+@pytest.mark.parametrize("text,answer", [
+    ("Answer: 1", "1"),
+    ("Answer: 0", "0"),
+    ("How many moons does Earth have?\nAnswer: 1", "1"),
+    ("Answer: Lisbon\n0.9", "Lisbon"),
+])
+def test_a_number_is_only_a_confidence_when_it_follows_the_label(text, answer):
+    """There used to be a fallback that read a bare number off the last line.
+
+    With no confidence line the last line is the ANSWER, so "Answer: 1" was
+    read as confidence 1.0 and marked ok -- a trivia answer became a confidence
+    score. The value must follow a Confidence label or it is not a value.
+    """
+    p = parse_answer_and_vc(text)
+    assert p.answer == answer
+    assert p.vc is None
+    assert p.status == NO_CONFIDENCE_FIELD
+
+
 def test_parse_scales():
     assert parse_answer_and_vc("Answer: x\nConfidence: 0.8").vc == pytest.approx(0.8)
-    assert parse_answer_and_vc("Answer: x\nConfidence: 80%", "percent").vc == \
-        pytest.approx(0.8)
-    assert parse_answer_and_vc("Answer: x\nConfidence: 8", "outof10").vc == \
-        pytest.approx(0.8)
-    assert parse_answer_and_vc("Answer: x\nConfidence: highly confident",
-                               "verbal").vc == pytest.approx(0.95)
+    assert parse_answer_and_vc("Answer: x\nConfidence: 1").vc == pytest.approx(1.0)
+    assert parse_answer_and_vc("Answer: x\nConfidence: 0").vc == pytest.approx(0.0)
+    assert parse_answer_and_vc("Answer: x\nConfidence: .5").vc == pytest.approx(0.5)
 
 
-def test_verbal_scale_prefers_the_longest_matching_label():
-    assert parse_answer_and_vc("Answer: x\nConfidence: highly confident",
-                               "verbal").vc > \
-        parse_answer_and_vc("Answer: x\nConfidence: confident", "verbal").vc
+@pytest.mark.parametrize("token,status", [
+    ("confident", UNPARSEABLE_VALUE),
+    ("not confident", UNPARSEABLE_VALUE),
+    ("not certain", UNPARSEABLE_VALUE),
+    ("highly confident", UNPARSEABLE_VALUE),
+    ("high", UNPARSEABLE_VALUE),
+    ("90%", OUT_OF_RANGE),
+    ("90", OUT_OF_RANGE),
+])
+def test_only_a_plain_number_in_range_is_a_confidence(token, status):
+    """Word ladders are gone, and this is why.
+
+    They were matched as substrings, so "not confident" read 0.85 and "not
+    certain" read 1.00 -- an INVERTED value marked ok, in the direction that
+    makes VC look worse calibrated than it is. Negation-blindness is the same
+    failure that rules cosine out of clustering; it has no place in the
+    measurement either. A worded reply is now a recorded failure.
+    """
+    p = parse_answer_and_vc(f"Answer: x\nConfidence: {token}")
+    assert p.vc is None, f"{token!r} must not become a number"
+    assert p.status == status
+    assert p.answer == "x", "a bad confidence must not cost us the answer"
 
 
 def test_out_of_range_is_recorded_not_rescaled():
-    """A model answering 85 on a 0-1 scale is a scale-invariance violation and
-    must be visible as one, not quietly divided by 100."""
-    p = parse_answer_and_vc("Answer: x\nConfidence: 85", "unit")
+    """A model answering 85 when asked for a number in [0, 1] has not followed
+    the format. Dividing by 100 would launder that into a valid reading, so it
+    is recorded as out of range and shows up in the parse audit instead."""
+    p = parse_answer_and_vc("Answer: x\nConfidence: 85")
     assert p.vc is None
     assert p.status == OUT_OF_RANGE
 
@@ -813,27 +848,6 @@ def test_fabricated_questions_are_unique_and_known_unanswerable(cfg):
 # --------------------------------------------------------------------------
 # Prompt registry
 # --------------------------------------------------------------------------
-
-def test_verbal_confidence_is_mapped_onto_the_ladder_not_discarded():
-    """No prompt asks for a word -- every elicitation asks for a number in [0, 1].
-
-    Models answer "fairly confident" anyway. Mapping such a reply onto the ladder
-    keeps it as data instead of booking it as a parse failure, which would
-    understate the elicitation rate. The ladder lives with the prompts because it
-    is elicitation vocabulary; parsing imports the one definition.
-    """
-    from vc_uq import prompts
-    from vc_uq.parsing import VERBAL_SCALE, parse_vc_value
-
-    assert VERBAL_SCALE is prompts.VERBAL_SCALE
-    assert list(VERBAL_SCALE.values()) == sorted(VERBAL_SCALE.values()),         "insertion order is the ladder, so the values must ascend"
-
-    for word, value in VERBAL_SCALE.items():
-        assert parse_vc_value(word, "unit") == (value, "ok"), word
-    # Longest label first, so the substring match cannot swallow the qualifier.
-    assert parse_vc_value("highly confident", "unit")[0] == 0.95
-    assert parse_vc_value("confident", "unit")[0] == 0.85
-
 
 def test_unknown_prompt_variant_fails_before_the_model_loads(cfg):
     """A typo must not surface hours into Phase 5, after a full generation."""

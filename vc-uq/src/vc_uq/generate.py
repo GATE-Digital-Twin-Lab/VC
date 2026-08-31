@@ -93,8 +93,8 @@ class Generator:
         msgs = spec.build(question=row["question"])
         if self.is_mock:
             msgs = _mock_meta(msgs, {"qid": row["q_id"], "ds": row["dataset"],
-                                     "variant": spec.variant, "scale": spec.scale,
-                                     "kind": spec.kind, **extra})
+                                     "variant": spec.variant, "kind": spec.kind,
+                                     **extra})
         return msgs
 
     def _call(self, messages: list[dict], *, temperature: float, seed: int):
@@ -204,7 +204,7 @@ class Generator:
                 seed = derive_seed(self.run_seed, q["q_id"], draw_idx, temperature, variant)
                 msgs = self._messages(spec, q)
                 gen = self._call(msgs, temperature=temperature, seed=seed)
-                parsed = parse_answer_and_vc(gen.text, spec.scale)
+                parsed = parse_answer_and_vc(gen.text)
 
                 row: dict = {
                     "q_id": q["q_id"], "dataset": q["dataset"], "split": q["split"],
@@ -282,7 +282,7 @@ class Generator:
                 seed = derive_seed(self.run_seed, "pre", q["q_id"], repeat_idx, variant)
                 msgs = self._messages(spec, q)
                 gen = self._call(msgs, temperature=temperature, seed=seed)
-                parsed = parse_vc_only(gen.text, spec.scale)
+                parsed = parse_vc_only(gen.text)
                 rows.append({
                     "q_id": q["q_id"], "dataset": q["dataset"],
                     "repeat_idx": repeat_idx, "vc_pre": parsed.vc,

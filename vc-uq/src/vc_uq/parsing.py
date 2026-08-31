@@ -3,7 +3,24 @@
 The raw string is always retained. Parse failure is not swept up: if VC cannot
 be reliably elicited, that is a finding about VC, not a bug to be papered over
 with a default value (protocol section 4). A failed parse yields ``None``, never
-0.5.
+a number.
+
+Two rules follow from that, and both are narrower than they used to be:
+
+**The confidence must be a plain number in [0, 1].** Word ladders are gone. They
+were matched as substrings, so "not confident" scored 0.85 and "not certain"
+scored 1.00 -- an inverted reading marked ``ok``, in the direction that makes VC
+look worse calibrated than it is. Negation-blindness is the same failure that
+rules cosine out of clustering (see ``cluster``); it has no place in the
+measurement either. A worded reply is now ``unparseable_value`` and shows up in
+the audit.
+
+**The number must follow a Confidence label.** There was a fallback that read a
+bare number off the last line, meant for the slip where a model writes the value
+on its own line. When no confidence line existed at all, the last line was the
+ANSWER -- so ``Answer: 1`` was read as confidence 1.0, marked ``ok``. A trivia
+answer became a confidence score. Fabricating a value is exactly what this
+module exists not to do.
 """
 
 from __future__ import annotations
@@ -11,7 +28,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .prompts import VERBAL_SCALE, Scale  # noqa: F401  -- re-exported
+
 
 # Instruct models decorate. The fields are located by NAME, wherever they fall:
 # any preamble, any number of blank lines, trailing chatter and markdown around
@@ -24,11 +41,17 @@ _ANSWER_RE = re.compile(rf"^{_LEAD}answer{_MK}[:\-]{_MK}(.+?)\s*$",
                         re.IGNORECASE | re.MULTILINE)
 _CONF_LINE_RE = re.compile(rf"^{_LEAD}(?:confidence|certainty|probability)",
                            re.IGNORECASE)
+#: The value is whatever token follows the label; ``parse_vc_value`` decides
+#: whether it is a number. Capturing loosely and validating strictly keeps the
+#: failure legible -- "Confidence: high" becomes unparseable_value rather than
+#: no_confidence_field, so the audit distinguishes "did not answer in the
+#: format" from "did not produce a confidence line at all".
 _CONF_RE = re.compile(
-    rf"(?:confidence|certainty|probability){_MK}[:\-]?{_MK}"
-    r"(?P<value>[0-9]*\.?[0-9]+\s*%?|[A-Za-z][A-Za-z ]{2,24})",
+    rf"(?:confidence|certainty|probability){_MK}[:\-]?{_MK}(?P<value>[^\s,;]+)",
     re.IGNORECASE,
 )
+#: A plain decimal. No percent signs, no words, no thousands separators.
+_NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
 #: Stripped from the ends of a captured answer so "**Lisbon**" scores as
 #: "Lisbon". The answer text feeds e_cos against a_star, so leftover markup is
 #: noise in the correctness criterion rather than a cosmetic issue.
@@ -40,7 +63,7 @@ _BULLET_RE = re.compile(r"^\s*(?:[-*+>#]+\s+)+")
 
 def _strip_markup(text: str) -> str:
     return _BULLET_RE.sub("", text).strip().strip(_MARKUP_CHARS).strip()
-_BARE_NUM_RE = re.compile(r"(?<![\w.])(?P<value>[01](?:\.\d+)?|0?\.\d+|\d{1,3}\s*%)(?![\w.])")
+
 
 class ParseFailure(str):
     """Reason codes for the parse audit."""
@@ -65,45 +88,33 @@ class Parsed:
         return self.status == OK
 
 
-def parse_vc_value(text: str, scale: Scale = "unit") -> tuple[float | None, str]:
-    """Map a confidence token onto [0, 1]. Returns (value, status)."""
-    token = text.strip().strip(".,;").lower()
+def parse_vc_value(text: str) -> tuple[float | None, str]:
+    """Read a confidence token as a float in [0, 1]. Returns (value, status).
+
+    Strict on purpose. Anything that is not a plain decimal in range returns
+    ``None`` with a status, because every lenient reading this function could
+    make is a guess about what the model meant, and a guess recorded as ``ok``
+    is indistinguishable downstream from a real measurement.
+
+    A percentage is singled out from other junk: it is a recognisable number on
+    a scale the model was not asked for, which is a different finding from
+    unintelligible output, and rescaling it would launder a format failure into
+    a valid reading.
+    """
+    token = text.strip().rstrip(".,;:").strip()
     if not token:
         return None, UNPARSEABLE_VALUE
-
-    if scale == "verbal" or not re.search(r"\d", token):
-        # Longest label first so "highly confident" wins over "confident".
-        for label in sorted(VERBAL_SCALE, key=len, reverse=True):
-            if label in token:
-                return VERBAL_SCALE[label], OK
+    if token.endswith("%"):
+        return None, OUT_OF_RANGE
+    if not _NUMBER_RE.match(token):
         return None, UNPARSEABLE_VALUE
-
-    is_percent = "%" in token
-    num = re.search(r"[0-9]*\.?[0-9]+", token)
-    if num is None:
-        return None, UNPARSEABLE_VALUE
-    value = float(num.group())
-
-    if scale == "percent" or is_percent:
-        value = value / 100.0
-    elif scale == "outof10":
-        value = value / 10.0
-    elif scale == "unit" and value > 1.0:
-        # The model answered on a scale it was not asked for. Rescaling here
-        # would launder a failure to follow the elicitation format into a valid
-        # reading, so it is recorded as out of range and shows up in the parse
-        # audit instead.
-        if value <= 100.0:
-            return None, OUT_OF_RANGE
-        return None, UNPARSEABLE_VALUE
-
+    value = float(token)
     if not (0.0 <= value <= 1.0):
         return None, OUT_OF_RANGE
     return value, OK
 
 
-def parse_answer_and_vc(text: str, scale: Scale = "unit",
-                        *, require_answer: bool = True) -> Parsed:
+def parse_answer_and_vc(text: str) -> Parsed:
     raw = text if text is not None else ""
 
     m_ans = _ANSWER_RE.search(raw)
@@ -117,35 +128,26 @@ def parse_answer_and_vc(text: str, scale: Scale = "unit",
         answer = _strip_markup(lines[0]) if lines else ""
         answer_status = OK if lines else NO_ANSWER_FIELD
 
+    # No bare-number fallback: the value must follow a Confidence label. The
+    # last line of a reply with no confidence line is the ANSWER, and reading a
+    # digit out of it turned "Answer: 1" into confidence 1.0.
     m_conf = _CONF_RE.search(raw)
     if m_conf is None:
-        # A bare trailing number is a common format slip; accept it but keep the
-        # distinction visible via the status field.
-        tail = raw.strip().splitlines()[-1] if raw.strip() else ""
-        m_bare = _BARE_NUM_RE.search(tail)
-        if m_bare is None:
-            return Parsed(answer=answer, vc=None, raw=raw, status=NO_CONFIDENCE_FIELD)
-        value, status = parse_vc_value(m_bare.group("value"), scale)
-        return Parsed(answer=answer, vc=value, raw=raw,
-                      status=status if status != OK else OK)
+        return Parsed(answer=answer, vc=None, raw=raw, status=NO_CONFIDENCE_FIELD)
 
-    value, status = parse_vc_value(m_conf.group("value"), scale)
-    if require_answer and answer_status != OK:
+    value, status = parse_vc_value(m_conf.group("value"))
+    if answer_status != OK:
         status = NO_ANSWER_FIELD if status == OK else status
     return Parsed(answer=answer, vc=value, raw=raw, status=status)
 
 
-def parse_vc_only(text: str, scale: Scale = "unit") -> Parsed:
+def parse_vc_only(text: str) -> Parsed:
     """Pre-hoc elicitation: there is no answer to extract, by construction."""
     raw = text if text is not None else ""
     m_conf = _CONF_RE.search(raw)
     if m_conf is None:
-        m_bare = _BARE_NUM_RE.search(raw)
-        if m_bare is None:
-            return Parsed(answer="", vc=None, raw=raw, status=NO_CONFIDENCE_FIELD)
-        value, status = parse_vc_value(m_bare.group("value"), scale)
-        return Parsed(answer="", vc=value, raw=raw, status=status)
-    value, status = parse_vc_value(m_conf.group("value"), scale)
+        return Parsed(answer="", vc=None, raw=raw, status=NO_CONFIDENCE_FIELD)
+    value, status = parse_vc_value(m_conf.group("value"))
     return Parsed(answer="", vc=value, raw=raw, status=status)
 
 
@@ -176,18 +178,4 @@ def parse_audit_from_status(statuses) -> dict[str, float | int]:
 
 def parse_audit(parsed: list[Parsed]) -> dict[str, float | int]:
     """Parse-failure rates, reported alongside every VC result."""
-    n = len(parsed)
-    if n == 0:
-        return {"n": 0, "failure_rate": 0.0}
-    counts: dict[str, int] = {}
-    for p in parsed:
-        counts[p.status] = counts.get(p.status, 0) + 1
-    failures = n - counts.get(OK, 0)
-    out: dict[str, float | int] = {
-        "n": n,
-        "n_failed": failures,
-        "failure_rate": failures / n,
-    }
-    for status, c in sorted(counts.items()):
-        out[f"status__{status}"] = c
-    return out
+    return parse_audit_from_status(p.status for p in parsed)
