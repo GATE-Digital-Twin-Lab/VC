@@ -283,6 +283,14 @@ def step4_survival(state: PipelineState) -> PipelineState:
                            store.figure_path("product_rule"), cfg)
     plots.budget_collapse(questions, store.figure_path("budget_collapse"), cfg)
 
+    # Persist the enriched answers, not just the scored ones. step2 wrote this
+    # table BEFORE clustering, so `cluster_id`, `f` and `correct` existed only in
+    # memory -- which made every per-phase command after `survival` fail on a
+    # missing column, and would have put every draw of every question into one
+    # cluster had it not. Section 1 requires each phase to be re-runnable from
+    # the cache; that only holds if each phase writes what the next one reads.
+    store.write_processed("answers", answers)
+
     state.questions = questions
     state.km = km
     state.beta = beta

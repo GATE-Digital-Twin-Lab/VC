@@ -40,6 +40,9 @@ ANSWERS_SCHEMA: dict[str, tuple[str, bool]] = {
     "correct_cos": ("boolean", True),
     "correct_nli": ("boolean", True),
     "correct_human": ("boolean", True),    # Phase 0 subset only
+    # True where the chosen criterion was missing and `correct` was forced to
+    # False. Undefined is not the same as wrong; see judge.attach_correct.
+    "correct_undefined": ("boolean", True),
     # Declared, not incidental: the parse-failure rate is reported alongside
     # every VC result, so it has to survive a round trip through the cache.
     "parse_status": ("string", True),

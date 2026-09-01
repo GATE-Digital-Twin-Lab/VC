@@ -1379,3 +1379,225 @@ def test_vc_parse_failure_rate_is_fatal_above_the_limit(cfg):
     assert bad.passed is False and bad.severity == "fatal"
     assert "40.0%" in bad.detail
     assert "no_confidence_field" in bad.detail, "say WHICH failure dominates"
+
+
+# --------------------------------------------------------------------------
+# judge_nli batching, and undefined vs wrong
+# --------------------------------------------------------------------------
+
+def _answers_and_questions():
+    import pandas as pd
+
+    answers = pd.DataFrame([
+        {"q_id": "q0", "draw_idx": 0, "answer": "Lisbon"},
+        {"q_id": "q0", "draw_idx": 1, "answer": "Lisboa"},
+        {"q_id": "q0", "draw_idx": 2, "answer": "Madrid"},
+        {"q_id": "q1", "draw_idx": 0, "answer": "Oslo"},
+    ])
+    questions = pd.DataFrame([{"q_id": "q0", "a_star": "Lisbon"},
+                              {"q_id": "q1", "a_star": "Reykjavik"}])
+    return answers, questions
+
+
+def test_judge_nli_agrees_whether_or_not_the_judge_batches(cfg):
+    """Correctness must not depend on which API the judge happens to expose."""
+    from vc_uq.judge import judge_nli
+
+    answers, questions = _answers_and_questions()
+    table = _symmetric([("Lisbon", "Lisboa")])
+    for a in ("Lisbon", "Lisboa", "Madrid", "Oslo", "Reykjavik"):
+        table[(a, a)] = 0.99
+
+    pair = judge_nli(cfg, answers, questions, nli=_PairJudge(table))
+    batched = judge_nli(cfg, answers, questions, nli=_BatchJudge(table))
+
+    assert list(pair["correct_nli"]) == list(batched["correct_nli"])
+    assert list(pair["correct_nli"]) == [True, True, False, False]
+
+
+def test_judge_nli_sends_every_pair_in_one_call(cfg):
+    """2N forward passes at batch size 1 is most of the corpus wasted."""
+    from vc_uq.judge import judge_nli
+
+    answers, questions = _answers_and_questions()
+    judge = _BatchJudge({})
+    judge_nli(cfg, answers, questions, nli=judge)
+
+    assert judge.batches == 1, "one call for the whole column"
+    assert judge.batch_sizes == [2 * len(answers)], "both directions, all rows"
+    assert judge.calls == 0, "must not fall back to the per-pair API"
+
+
+@pytest.mark.parametrize("answer,a_star", [
+    ("Paris", "a city in France"),        # answer entails reference, not back
+    ("a city in France", "Paris"),        # reference entails answer, not back
+])
+def test_judge_nli_is_bidirectional(cfg, answer, a_star):
+    """One-way entailment is not sameness, in EITHER direction.
+
+    "Paris" entails "a city in France" but the two are not the same answer, so
+    accepting the one-way relation would mark a vague reply correct against a
+    specific reference (or the reverse). Both orientations are parametrised
+    because checking only one lets an implementation that drops fwd or bwd pass.
+    """
+    import pandas as pd
+
+    from vc_uq.judge import judge_nli
+
+    answers = pd.DataFrame([{"q_id": "q0", "draw_idx": 0, "answer": answer}])
+    questions = pd.DataFrame([{"q_id": "q0", "a_star": a_star}])
+    one_way = {("Paris", "a city in France"): 0.99,
+               ("a city in France", "Paris"): 0.02}
+
+    for judge in (_PairJudge(one_way), _BatchJudge(one_way)):
+        got = judge_nli(cfg, answers, questions, nli=judge)["correct_nli"].tolist()
+        assert got == [False], f"{answer!r} vs {a_star!r} with {type(judge).__name__}"
+
+
+def test_an_undefined_criterion_is_marked_not_absorbed(cfg):
+    """`correct` must be a plain bool, so NA becomes False -- but visibly.
+
+    An undefined criterion recorded as a wrong answer pushes p_hat down and
+    beta up, and inflates U with an instrument artifact rather than a finding
+    about the model.
+    """
+    import pandas as pd
+
+    from vc_uq.judge import attach_correct
+
+    df = pd.DataFrame({
+        "q_id": ["q0", "q1", "q2"],
+        "correct_cos": pd.array([True, None, False], dtype="boolean"),
+    })
+    out = attach_correct(cfg.with_overrides(["judge.primary=cos"]), df)
+
+    assert list(out["correct"]) == [True, False, False]
+    assert list(out["correct_undefined"]) == [False, True, False]
+
+
+def test_pitfall_reports_undefined_correctness(cfg):
+    import pandas as pd
+
+    from vc_uq.pitfalls import run_checks
+
+    name = "correctness is defined for every scored answer"
+    clean = pd.DataFrame({"correct_undefined": [False, False]})
+    assert next(c for c in run_checks(cfg, answers=clean).checks
+                if c.name == name).passed is True
+
+    dirty = pd.DataFrame({"correct_undefined": [False, True, True]})
+    check = next(c for c in run_checks(cfg, answers=dirty).checks if c.name == name)
+    assert check.passed is False and check.severity == "warn"
+    assert "2 of 3" in check.detail
+
+
+def test_medoid_anchor_is_the_most_central_actual_draw(cfg):
+    """The anchor must be a real draw, deterministic, and label-free.
+
+    Deterministic because CLM's guarantee is conditional on the anchor being a
+    fixed function of the draws; label-free because a_star does not exist at
+    test time; an actual draw rather than a centroid because a mean vector
+    corresponds to no text and cannot be embedded or compared.
+    """
+    from vc_uq.backends.mock import MockEmbedder
+    from vc_uq.judge import EmbeddingSpace, medoid_anchor
+
+    draws = ["Lisbon [[sem:a]]", "Lisboa [[sem:a]]", "Lisbon, Portugal [[sem:a]]",
+             "Porto [[sem:b]]", "Madrid [[sem:c]]"]
+    emb = MockEmbedder(dim=64, noise=0.25, seed=3)
+    space = EmbeddingSpace(vectors=dict(zip(draws, emb.embed(draws))), dim=64,
+                           mean_centered=False, whitened=False)
+
+    pick = medoid_anchor(draws, space)
+    assert pick in draws, "the anchor is a member of the set, not a mean vector"
+    assert "sem:a" in pick, "it must land in the dominant cluster, not on an outlier"
+    assert medoid_anchor(draws, space) == pick, "deterministic"
+    assert medoid_anchor(list(reversed(draws)), space) == pick, \
+        "order of the draw list must not change which draw is most central"
+    assert medoid_anchor(["only one"], space) == "only one"
+
+
+# --------------------------------------------------------------------------
+# Sample-diversity signals: descriptive, never a stopping rule
+# --------------------------------------------------------------------------
+
+def test_diversity_signals_are_not_stopping_rules(cfg):
+    """A diversity statistic over one draw is not a value.
+
+    One draw is one cluster, so H_sem reads 0 and largest-share reads 1 -- the
+    exact values a "stop when converged" rule treats as convergence. As online
+    rules they fire at k=1 for every threshold, which makes them duplicates of
+    fixed_k=1 under names that imply otherwise. A minimum draw count would fix
+    that by changing the efficiency each rule reports, so they are kept out of
+    the stopping table entirely.
+    """
+    from vc_uq import clm
+
+    for name in ("self_consistency", "semantic_entropy"):
+        assert name not in cfg.get("phase4.stop_rules")
+        assert name not in clm.RULE_DIRECTION
+        assert name not in clm.RULE_UNITS
+
+    # Every configured rule is implemented and declares a direction and a unit.
+    for rule in cfg.get("phase4.stop_rules"):
+        assert rule in clm.RULE_DIRECTION, rule
+        assert rule in clm.RULE_UNITS, rule
+    assert "fixed_k" in cfg.get("phase4.stop_rules"), "the null baseline is mandatory"
+
+
+def test_diversity_signals_survive_as_descriptive_comparators(cfg):
+    """Dropping them as rules must not drop them as baselines.
+
+    The claim that diversity-based signals also fail on low-diversity U rests on
+    these, so they have to keep reaching the 6.6 2x2 and the Phase 2 AUROC
+    comparison.
+    """
+    import pandas as pd
+
+    from vc_uq.cluster import cluster_frame, question_diversity, semantic_entropy
+
+    rows = [{"q_id": "q0", "draw_idx": i, "answer": a} for i, a in
+            enumerate(["Lisbon", "Lisbon", "Madrid", "Lisbon"])]
+    df = cluster_frame(cfg, pd.DataFrame(rows), nli=_PairJudge({}))
+
+    assert "cluster_id" in df.columns
+    assert "f" in df.columns, "per-answer self-consistency feeds the Phase 2 AUROCs"
+
+    div = question_diversity(df).iloc[0]
+    assert div["n_clusters"] == 2
+    assert div["largest_cluster_share"] == pytest.approx(0.75)
+    assert div["H_sem"] == pytest.approx(semantic_entropy([0, 0, 1, 0]))
+    assert div["H_sem"] > 0
+
+
+def test_the_per_phase_workflow_carries_its_state_forward(cfg):
+    """Each phase must write what the next one reads (protocol section 1).
+
+    step2 wrote the answers table BEFORE clustering, so cluster_id, f and
+    correct lived only in memory: every per-phase command after `survival`
+    failed on a missing column, and had it not, every draw of every question
+    would have landed in one cluster.
+    """
+    from vc_uq import pipeline
+    from vc_uq.datasets import build_questions
+    from vc_uq.store import Store
+
+    c = cfg.with_overrides(["dataset.triviaqa.n_questions=24",
+                            "dataset.fabricated.n_questions=8",
+                            "generation.n_max=6", "phase0.n_hand_label=40",
+                            "phase0.stratify_bins=3",
+                            "phase0.null_band.n_mismatched_pairs=200"])
+    store = Store(c)
+    state = pipeline.PipelineState(cfg=c, store=store)
+    state.questions = build_questions(c)
+    state = pipeline.step3_generate(state)
+    state = pipeline.step2_gate(state, simulate_labels=True)
+    state = pipeline.step4_survival(state)
+
+    # What a later `vc_uq clm` would actually load off disk.
+    reloaded = store.read_answers()
+    for col in ("cluster_id", "f", "correct"):
+        assert col in reloaded.columns, f"{col} was not persisted by survival"
+    assert reloaded["cluster_id"].notna().all(), "cluster_id must not be all null"
+    assert reloaded.groupby("q_id")["cluster_id"].nunique().max() > 1, \
+        "every draw landing in one cluster is the failure this guards against"

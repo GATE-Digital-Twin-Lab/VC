@@ -200,13 +200,24 @@ def judge_nli(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
     thr = float(cfg.get("nli.entail_threshold"))
     q_idx = questions.set_index("q_id")["a_star"].astype(str)
     out = answers.copy()
-    verdicts = []
-    for q_id, ans in zip(out["q_id"], out["answer"].astype(str)):
-        ref = q_idx.get(q_id, "")
-        fwd = nli.entailment_prob(ans, ref)
-        bwd = nli.entailment_prob(ref, ans)
-        verdicts.append(bool(min(fwd, bwd) >= thr))
-    out["correct_nli"] = verdicts
+    ans = out["answer"].astype(str).tolist()
+    refs = [q_idx.get(q, "") for q in out["q_id"]]
+    n = len(ans)
+
+    # Every (answer, a_star) pair here is independent -- unlike the greedy loop
+    # in cluster_answers, there is no order to preserve -- so the whole column
+    # goes to the judge in one call and entailment_probs chunks it. At batch
+    # size 1 an encoder head wastes almost all of a GPU, and this is 2N forward
+    # passes over the full corpus.
+    batch = getattr(nli, "entailment_probs", None)
+    if batch is not None:
+        probs = np.asarray(list(batch(ans + refs, refs + ans)), dtype=float)
+        fwd, bwd = probs[:n], probs[n:]
+    else:
+        fwd = np.array([nli.entailment_prob(a, r) for a, r in zip(ans, refs)])
+        bwd = np.array([nli.entailment_prob(r, a) for a, r in zip(ans, refs)])
+
+    out["correct_nli"] = (np.minimum(fwd, bwd) >= thr) if n else []
     return out
 
 
@@ -218,7 +229,16 @@ def correctness_column(cfg: Config) -> str:
 
 
 def attach_correct(cfg: Config, answers: pd.DataFrame) -> pd.DataFrame:
-    """Materialise the single ``correct`` column every phase reads."""
+    """Materialise the single ``correct`` column every phase reads.
+
+    A row whose criterion is missing is forced to False, because the downstream
+    phases need a plain bool. That is a real assumption, not a formality: an
+    UNDEFINED criterion is being recorded as a WRONG answer, which pushes p_hat
+    down and beta up. It is reachable -- ``e_cos <= tau`` on a nullable Float64
+    column yields pd.NA, and a failed parse still produces an empty answer that
+    gets embedded -- so the affected rows are marked in ``correct_undefined``
+    rather than absorbed, and a pitfall check reports the count.
+    """
     col = correctness_column(cfg)
     if col not in answers.columns or answers[col].isna().all():
         raise ValueError(
@@ -226,5 +246,7 @@ def attach_correct(cfg: Config, answers: pd.DataFrame) -> pd.DataFrame:
             "to nli) before any downstream phase can define correctness."
         )
     out = answers.copy()
+    undefined = out[col].isna()
+    out["correct_undefined"] = undefined.to_numpy(dtype=bool)
     out["correct"] = out[col].astype("boolean").fillna(False).astype(bool)
     return out

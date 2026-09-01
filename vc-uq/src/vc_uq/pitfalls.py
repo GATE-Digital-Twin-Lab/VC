@@ -278,6 +278,16 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
               "Elicitation is the measurement; below this the tables are empty rather "
               "than negative.")
 
+    # -- an undefined criterion silently counted as a wrong answer --
+    if _has(answers, "correct_undefined"):
+        n_undef = int(answers["correct_undefined"].fillna(False).astype(bool).sum())
+        r.add("correctness is defined for every scored answer",
+              n_undef == 0, "warn",
+              f"{n_undef} of {len(answers)} answers had no criterion value and were "
+              "counted as WRONG. Undefined is not the same as incorrect: this pushes "
+              "p_hat down and beta up, and inflates U with an instrument artifact."
+              if n_undef else "every scored answer has a criterion value")
+
     # -- every config-named prompt variant actually exists --
     unknown = prompts.unknown_config_variants(cfg)
     r.add("every prompt variant named in config is registered",

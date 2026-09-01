@@ -246,9 +246,16 @@ phase4:
     - vc_prehoc
     - token_entropy
     - min_token_p
-    - self_consistency
-    - semantic_entropy
     - fixed_k          # mandatory null baseline
+  # self_consistency and semantic_entropy are NOT here. They are diversity
+  # statistics over a set of draws, and at k = 1 they are undefined rather than
+  # extreme: one draw is one cluster, so entropy reads 0 and largest-share reads
+  # 1 -- the exact values that make a "stop when converged" rule fire. Every
+  # grid point then stops at the first draw. Imposing a minimum draw count
+  # would fix that by changing the efficiency each rule reports, so they are
+  # reported DESCRIPTIVELY instead: `f` per answer in the Phase 2 AUROC
+  # comparison, H_sem and largest_cluster_share per question in the 6.6
+  # diversity 2x2. Their mechanism is still represented in the baseline table.
   quality_score: vc_post      # vc_post | neg_s_anchor (ablation: biases to mode collapse)
   fwer: fixed_sequence        # fixed_sequence | bonferroni
   vacuity:

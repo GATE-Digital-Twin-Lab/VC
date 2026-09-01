@@ -6,9 +6,17 @@ answer into one cluster and silently destroy the diversity 2x2 that the whole of
 6.6 rests on. Entailment must hold in BOTH directions for two answers to be
 called the same.
 
-From the clusters come the sample-diversity baseline family: answer frequency
-``f``, semantic entropy ``H_sem``, and the largest-cluster share used by the
-self-consistency stopping rule.
+From the clusters comes the sample-diversity baseline family: answer frequency
+``f`` per answer, and ``H_sem`` plus the largest-cluster share per question.
+
+These are DESCRIPTIVE comparators, not stopping rules. A diversity statistic
+computed after one draw is not a low value, it is not a value -- one draw is one
+cluster, so H_sem reads 0 and largest-share reads 1, the exact values a "stop
+when converged" rule treats as convergence. As online rules they would fire on
+the first draw at every threshold; as descriptions of a completed set of N draws
+they are exactly what 6.6 needs. So ``f`` enters the Phase 2 AUROC comparison
+and the per-question summaries feed the diversity 2x2, and neither appears in
+``phase4.stop_rules``.
 """
 
 from __future__ import annotations
@@ -136,23 +144,3 @@ def question_diversity(answers: pd.DataFrame) -> pd.DataFrame:
             "largest_cluster_share": float(counts.max() / counts.sum()),
         })
     return pd.DataFrame(rows)
-
-
-def prefix_semantic_entropy(cluster_ids: list[int]) -> list[float]:
-    """H_sem over the first k draws, for k = 1..n.
-
-    The semantic-entropy stopping rule has to decide after each draw using only
-    the draws it has seen, so it needs the running value, not the final one.
-    """
-    out = []
-    for k in range(1, len(cluster_ids) + 1):
-        out.append(semantic_entropy(cluster_ids[:k]))
-    return out
-
-
-def prefix_largest_share(cluster_ids: list[int]) -> list[float]:
-    out = []
-    for k in range(1, len(cluster_ids) + 1):
-        _, counts = np.unique(np.asarray(cluster_ids[:k]), return_counts=True)
-        out.append(float(counts.max() / counts.sum()))
-    return out

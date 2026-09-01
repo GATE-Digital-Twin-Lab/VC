@@ -86,6 +86,7 @@ attributed to VC specifically:
 |---|---|---|---|
 | Token-level | `h_tok_mean`, `min_token_p`, `logp_mean` | full next-token distributions, one pass | fluent memorised falsehoods — surface form, not semantics |
 | Sample-diversity | `f`, `H_sem` | spread across N draws | mode-collapsed wrong answers (low-diversity `U`) |
+| | *(descriptive only — undefined after one draw, so not an online stopping rule; see section 7)* | | |
 | Verbalised | `vc_pre`, `vc_post` | generated text | *under test* |
 
 Low token entropy on a wrong answer, and low semantic entropy on a wrong answer, are
@@ -443,9 +444,18 @@ succeeded." Baselines fail identically and the compute is wasted.
 | `vc_prehoc` | `vc_pre >= lambda_stop` — budget fixed **before any draw**; the purest test of prospective VC |
 | `token_entropy` | `min_{i<=k} h_tok_mean_i <= lambda_stop` — family-1 baseline |
 | `min_token_p` | `max_{i<=k} min_token_p_i >= lambda_stop` |
-| `self_consistency` | largest cluster share `>= lambda_stop` |
-| `semantic_entropy` | `H_sem(a_1..k) <= lambda_stop` |
 | **`fixed_k`** | `k >= lambda_stop` — **the null baseline** |
+
+The sample-diversity signals are **not** stopping rules here. A diversity
+statistic over one draw is not a low value, it is not a value: one draw is one
+cluster, so `H_sem = 0` and largest-share `= 1` — exactly the values a
+"stop when converged" rule reads as convergence. Both would therefore fire at
+`k = 1` for every threshold, making them duplicates of `fixed_k = 1` under names
+that imply otherwise. The alternative, a minimum draw count before either may
+fire, changes the efficiency each rule reports and so alters the very quantity
+the table compares. They are reported descriptively instead (section 6.6 and the
+Phase 2 AUROC comparison), which is where a statistic over a completed set of
+`N` draws belongs.
 
 `fixed_k` is mandatory. If VC-based stopping cannot beat "always draw exactly k," VC
 carries no usable information about when to stop, and that is the cleanest statement of it.
@@ -502,8 +512,6 @@ For `alpha in {0.05, 0.1, 0.2}`, `delta = 0.1`:
 | vc_prehoc | | | | | | |
 | token_entropy | | | | | | |
 | min_token_p | | | | | | |
-| self_consistency | | | | | | |
-| semantic_entropy | | | | | | |
 | fixed_k | | | | | | |
 
 **Risk is held constant by construction; efficiency is the free variable.** That is what
@@ -655,9 +663,11 @@ non-invariance are already a contribution.
    abstention is the only correct action.
 5. Diversity-based signals (self-consistency, semantic entropy) **also** fail on
    low-diversity-`U`, so this is a limitation of the dominant approach, not only of VC.
-   The baseline table spans two mechanisms — token-level (`h_tok`, `min_token_p`) and
-   sample-diversity (`f`, `H_sem`) — so "VC fails here" can be separated from
-   "everything fails here."
+   This claim rests on the 6.6 diversity 2x2 and the Phase 2 AUROC comparison, where
+   `f` and `H_sem` describe a completed set of `N` draws — not on the stopping table,
+   which they cannot enter for the reason given in section 7. The stopping table still
+   spans two mechanisms, token-level (`h_tok`, `min_token_p`) and verbalised, so "VC
+   fails here" can be separated from "everything fails here."
 6. **Pre-hoc VC ("can you answer this?") is a distinct and under-studied construct.**
    The ladder `vc_prehoc -> vc_first -> vc_product` measures the marginal value of each
    additional piece of evidence. If flat, post-hoc VC is not reading its own answer and

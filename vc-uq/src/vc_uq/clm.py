@@ -29,7 +29,6 @@ import numpy as np
 import pandas as pd
 
 from .backends.base import pairwise_cosine_distance
-from .cluster import prefix_largest_share, prefix_semantic_entropy
 from .config import Config
 from .ltt import feasibility, run_ltt
 from .stats import ONE_MINUS_VC_FLOOR, log_one_minus_vc, log_to_prob
@@ -43,10 +42,16 @@ RULE_DIRECTION: dict[str, str] = {
     "vc_prehoc": "ge",
     "token_entropy": "le",
     "min_token_p": "ge",
-    "self_consistency": "ge",
-    "semantic_entropy": "le",
     "fixed_k": "ge",
 }
+# The sample-diversity signals (largest-cluster share, H_sem) are deliberately
+# absent. A diversity statistic over one draw is not a low value, it is not a
+# value: one draw is one cluster, so H_sem = 0 and share = 1, which are exactly
+# the values a "stop when converged" rule treats as convergence. They would fire
+# on the first draw at every grid point, making both rules a duplicate of
+# fixed_k = 1 under a name that implies otherwise. Requiring a minimum draw
+# count would change the efficiency they report, so they are reported
+# descriptively instead -- see cluster.question_diversity and the 6.6 2x2.
 
 #: Rules that commit to a budget without adapting to what the draws show.
 NON_ADAPTIVE = ("vc_first", "vc_prehoc", "fixed_k")
@@ -60,8 +65,6 @@ RULE_UNITS: dict[str, str] = {
     "vc_prehoc": "probability",
     "token_entropy": "nats per token",
     "min_token_p": "probability",
-    "self_consistency": "share",
-    "semantic_entropy": "nats",
     "fixed_k": "draws",
 }
 
@@ -186,10 +189,6 @@ def running_statistic(trace: QuestionTrace, rule: str,
         out = np.minimum.accumulate(trace.h_tok)
     elif rule == "min_token_p":
         out = np.maximum.accumulate(trace.min_token_p)
-    elif rule == "self_consistency":
-        out = np.asarray(prefix_largest_share(list(trace.cluster_id)))
-    elif rule == "semantic_entropy":
-        out = np.asarray(prefix_semantic_entropy(list(trace.cluster_id)))
     elif rule == "fixed_k":
         out = np.arange(1, n + 1, dtype=np.float64)
     else:
