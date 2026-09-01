@@ -147,6 +147,20 @@ dataset:
 
 generation:
   n_max: 40                   # N_MAX draws per question
+  # Protocol 6.4 step 3. Phase 1 draws N_MAX on EVERY question (the "classify"
+  # pass) and then draws a second, independent N_MAX on the questions in these
+  # splits (the "downstream" pass). The first decides in_U; the second is what
+  # Phase 2, Phase 4 and 6.7 are calibrated and evaluated on. Deciding U with
+  # the same draws that are later certified is selection on the outcome being
+  # certified: it voids the LTT guarantee, and it makes the 6.7 U-curve
+  # tautological -- "none of the first k draws was correct" is true by
+  # construction for every question the subset was defined to contain, so the
+  # observed frequency reads 1.0 at every k whatever VC claimed.
+  #
+  # The cost is one extra generation pass over these splits (~1.6x total at the
+  # default shares). Set to [] to reproduce the single-pass behaviour, and then
+  # do not quote 6.7 or Phase 4.
+  downstream_splits: [calib, eval]
   temperature: 0.8            # fixed T for the main table
   r_pre: 10                   # vc_pre elicitations per question
   prompt_variant_post: vc_post_v1

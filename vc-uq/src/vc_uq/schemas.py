@@ -14,11 +14,25 @@ import pandas as pd
 
 SPLITS = ("tau_select", "classify", "calib", "eval")
 
+# Two INDEPENDENT passes of N_MAX draws (protocol 6.4). The "classify" pass runs
+# on every question and is what decides `in_U`, `p_hat`, `K_q` and the survival
+# curve. The "downstream" pass runs on the calib/eval questions only and is the
+# one everything certified is calibrated and evaluated on. They are kept in the
+# same table because they are the same kind of row, and told apart by this
+# column -- which is part of the cache key, so a row can never be mistaken for
+# the other pass's.
+DRAW_SETS = ("classify", "downstream")
+
 # column -> (pandas dtype, nullable, note)
 ANSWERS_SCHEMA: dict[str, tuple[str, bool]] = {
     "q_id": ("string", False),
     "dataset": ("string", False),
     "split": ("string", False),
+    # "classify" or "downstream"; see DRAW_SETS. Non-nullable on purpose: a draw
+    # whose pass is unknown cannot be used for either purpose, so a cache
+    # written before this column existed must be regenerated rather than guessed
+    # at. conform() will say so by name.
+    "draw_set": ("string", False),
     "draw_idx": ("int32", False),
     "answer": ("string", False),
     "vc_post": ("Float64", True),          # nullable: parse failure is a finding
@@ -92,6 +106,7 @@ VC_PRE_REPEATS_SCHEMA: dict[str, tuple[str, bool]] = {
 PER_POSITION_SCHEMA: dict[str, tuple[str, bool]] = {
     "q_id": ("string", False),
     "dataset": ("string", False),
+    "draw_set": ("string", False),
     "draw_idx": ("int32", False),
     "temperature": ("Float64", False),
     "prompt_variant": ("string", False),
@@ -102,7 +117,8 @@ PER_POSITION_SCHEMA: dict[str, tuple[str, bool]] = {
 }
 
 # Generation cache key (protocol section 1). Uniqueness is enforced on write.
-ANSWER_KEY = ("model", "dataset", "q_id", "draw_idx", "temperature", "prompt_variant", "seed")
+ANSWER_KEY = ("model", "dataset", "q_id", "draw_set", "draw_idx", "temperature",
+              "prompt_variant", "seed")
 VC_PRE_KEY = ("model", "dataset", "q_id", "repeat_idx", "prompt_variant", "seed")
 
 

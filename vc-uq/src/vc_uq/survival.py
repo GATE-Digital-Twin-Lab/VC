@@ -10,6 +10,14 @@ a first-class quantity.
 
 ``beta`` must be known BEFORE any ``alpha`` is chosen. If ``alpha < beta`` no
 stopping rule of any kind can be certified and Phase 4 returns a blank table.
+
+Which draws each block reads is not incidental (protocol 6.4). The survival
+picture -- ``question_stats``, ``kaplan_meier``, ``hazard``, ``partition_U`` --
+reads the ``classify`` pass. The product-rule curves read the ``downstream``
+pass. They are disjoint by construction and :func:`assert_disjoint_draws` says
+so out loud, because if U were decided on the draws it is then measured on,
+"none of the first k was correct" would hold by definition and the observed
+frequency would read 1.0 at every k whatever VC claimed.
 """
 
 from __future__ import annotations
@@ -18,19 +26,22 @@ import numpy as np
 import pandas as pd
 
 from .config import Config
-from .stats import (NAN, auroc, auroc_cluster_ci, log_product_claim,
-                    wilson_interval)
+from .stats import (NAN, auroc_cluster_ci, log_product_claim, wilson_interval)
 
 
 # --------------------------------------------------------------------------
 # Question-level aggregation
 # --------------------------------------------------------------------------
 
-def question_stats(answers: pd.DataFrame, n_max: int | None = None) -> pd.DataFrame:
-    """p_hat, K_q, censoring, and the three question-level VC statistics."""
+def question_stats(answers: pd.DataFrame) -> pd.DataFrame:
+    """p_hat, K_q, censoring, and the three question-level VC statistics.
+
+    Pass ONE draw set (protocol 6.4): ``K_q`` and ``censored`` define membership
+    in U, so they must come from the classification pass and never from the
+    draws anything downstream is certified on.
+    """
     if "correct" not in answers.columns:
         raise ValueError("answers must carry a 'correct' column; call judge.attach_correct")
-    n_max = n_max or int(answers.groupby("q_id")["draw_idx"].size().max())
     rows = []
     for q_id, g in answers.sort_values("draw_idx").groupby("q_id"):
         c = g["correct"].astype(bool).to_numpy()
@@ -152,19 +163,27 @@ def hazard(answers: pd.DataFrame, max_k: int) -> pd.DataFrame:
 # U / A partition -- ORDER MATTERS
 # --------------------------------------------------------------------------
 
-def partition_U(answers: pd.DataFrame, *, classify_split: str = "classify") -> pd.DataFrame:
-    """Membership in U decided from the CLASSIFY split's draws only.
+def partition_U(answers: pd.DataFrame, *, draw_set: str = "classify") -> pd.DataFrame:
+    """Membership in U decided from the CLASSIFICATION pass's draws only.
 
     "Unanswerable" is not a label anyone has; it is defined by the outcome of
     generation. Deciding membership with the same draws that later calibrate the
     stopping rule is selection on the outcome being certified and voids the LTT
-    guarantee, so classification and calibration are given disjoint draws.
+    guarantee, so protocol 6.4 gives classification and everything downstream
+    two independent passes of N_MAX draws.
+
+    It reads ``draw_set``, not ``split``. Splits are by question, so filtering on
+    ``split == "classify"`` would decide U for the 30% of questions in that
+    split using *all* of their draws -- which is the same draws, under another
+    name -- and leave the calib/eval questions with no membership at all. The
+    pass is the thing that has to be held out, not the question.
     """
-    sub = answers[answers["split"] == classify_split]
+    sub = answers[answers["draw_set"] == draw_set]
     if sub.empty:
         raise ValueError(
-            f"the {classify_split!r} split has no draws. U must be decided on draws "
-            "that are never reused for calibration or evaluation.")
+            f"the {draw_set!r} draw set is empty. U must be decided on draws that "
+            "are never reused for calibration or evaluation; see protocol 6.4 and "
+            "generation.downstream_splits.")
     grp = sub.groupby("q_id")["correct"]
     out = grp.max().rename("any_correct").reset_index()
     out["in_U"] = ~out["any_correct"].astype(bool)
@@ -172,13 +191,24 @@ def partition_U(answers: pd.DataFrame, *, classify_split: str = "classify") -> p
     return out[["q_id", "in_U", "n_classify_draws"]]
 
 
-def assert_disjoint_draws(classify: pd.DataFrame, calib: pd.DataFrame) -> None:
+def assert_disjoint_draws(classify: pd.DataFrame, downstream: pd.DataFrame) -> None:
+    """No draw may both decide U and be certified on.
+
+    Called by the pipeline on every run rather than kept as documentation. The
+    seed is salted with the pass name, so an overlap here means the two passes
+    were not actually generated separately -- and the failure it prevents is
+    silent: the 6.7 U-curve would report an observed frequency of 1.0 at every
+    k, which reads as a spectacular result and is only the subset's definition
+    restated.
+    """
     key = ["q_id", "draw_idx", "seed"]
-    overlap = classify.merge(calib, on=key, how="inner")
+    if not len(classify) or not len(downstream):
+        return
+    overlap = classify[key].merge(downstream[key], on=key, how="inner")
     if len(overlap):
         raise ValueError(
-            f"{len(overlap)} draws appear in both the classify and calibration sets. "
-            "Reusing them selects on the outcome being certified.")
+            f"{len(overlap)} draws appear in both the classification pass and the "
+            "downstream pass. Reusing them selects on the outcome being certified.")
 
 
 def beta_vs_tau(answers: pd.DataFrame, e_col: str, taus) -> pd.DataFrame:
@@ -364,12 +394,21 @@ def product_rule_curve(answers: pd.DataFrame, cfg: Config, *,
     rows = []
     for k in ks:
         recs = []
+        # Both exclusions are reported, not silent. A question dropped for an
+        # unparsed VC is not a random question -- the draws that fail to state a
+        # confidence are plausibly the ones the model is least sure of -- so the
+        # denominator has to travel with the curve for the bin frequencies to
+        # mean anything.
+        n_short = 0
+        n_unparsed = 0
         for q_id, g in answers.sort_values("draw_idx").groupby("q_id"):
             g = g.head(k)
             if len(g) < k:
+                n_short += 1
                 continue
             vc = g["vc_post"].astype(float)
             if vc.isna().any():
+                n_unparsed += 1
                 continue
             # Sum of logs, matching the Phase 4 stopping statistic exactly. The
             # diagnostic and the rule must accumulate the claim the same way, or
@@ -381,6 +420,8 @@ def product_rule_curve(answers: pd.DataFrame, cfg: Config, *,
         if not recs:
             continue
         df = pd.DataFrame(recs)
+        n_binned = len(df)
+        n_offered = n_binned + n_short + n_unparsed
         # Bin on the log: the ordering is identical, but the linear product
         # underflows to a wall of exact zeros at large k, which would collapse
         # the low bins into one indistinguishable group.
@@ -392,6 +433,10 @@ def product_rule_curve(answers: pd.DataFrame, cfg: Config, *,
                                     n=("q_id", "size")).reset_index()
         agg["k"] = k
         agg["subset"] = subset
+        agg["n_questions_binned"] = n_binned
+        agg["n_dropped_short_of_k"] = n_short
+        agg["n_dropped_unparsed_vc"] = n_unparsed
+        agg["frac_dropped_unparsed_vc"] = (n_unparsed / n_offered) if n_offered else NAN
         # Displayed on log axes anyway; the floor only guards the plot.
         agg["claimed"] = np.exp(np.clip(agg["log_claimed"], log_floor, 0.0))
         agg["log_ratio"] = (np.log(agg["observed"].clip(lower=floor))
@@ -401,7 +446,9 @@ def product_rule_curve(answers: pd.DataFrame, cfg: Config, *,
         rows.append(agg)
     if not rows:
         return pd.DataFrame(columns=["bin", "log_claimed", "claimed", "observed",
-                                     "n", "k", "subset"])
+                                     "n", "k", "subset", "n_questions_binned",
+                                     "n_dropped_short_of_k", "n_dropped_unparsed_vc",
+                                     "frac_dropped_unparsed_vc"])
     out = pd.concat(rows, ignore_index=True)
     return out
 
@@ -423,5 +470,13 @@ def product_rule_divergence(curve: pd.DataFrame) -> pd.DataFrame:
             "median_ratio": float(g["ratio_observed_over_claimed"].median()),
             "max_ratio": float(g["ratio_observed_over_claimed"].max()),
             "empirical_floor": float(g["observed"].min()),
+            # Constant within a (k, subset) group; carried up so the denominator
+            # is visible next to the ratio it produced.
+            "n_questions_binned": int(g["n_questions_binned"].iloc[0])
+            if "n_questions_binned" in g else -1,
+            "n_dropped_unparsed_vc": int(g["n_dropped_unparsed_vc"].iloc[0])
+            if "n_dropped_unparsed_vc" in g else -1,
+            "n_dropped_short_of_k": int(g["n_dropped_short_of_k"].iloc[0])
+            if "n_dropped_short_of_k" in g else -1,
         })
     return pd.DataFrame(rows).sort_values(["subset", "k"]).reset_index(drop=True)

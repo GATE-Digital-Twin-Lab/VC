@@ -140,8 +140,9 @@ re-sampling.
 |---|---|---|
 | `q_id` | str | |
 | `dataset` | str | |
-| `split` | str | one of `tau_select`, `classify`, `calib`, `eval` |
-| `draw_idx` | int | 0..N_MAX-1 |
+| `split` | str | one of `tau_select`, `classify`, `calib`, `eval` — a property of the QUESTION |
+| `draw_set` | str | `classify` or `downstream` — which generation pass produced this draw (6.4) |
+| `draw_idx` | int | 0..N_MAX-1, within the pass |
 | `answer` | str | |
 | `vc_post` | float | `VC_post(q,a_i)`, nullable if parse failed |
 | `vc_post_raw` | str | raw model string — keep for parse audit |
@@ -320,12 +321,30 @@ one sample to never. Report this as the dynamic-range collapse, in units of comp
 ### 6.4 U/A partition — ORDER MATTERS
 "Unanswerable" is not a label you have; it is *defined by the outcome of generation*. So:
 
-1. Draw `N_MAX` on **all** questions.
-2. Partition post hoc using the **`classify` split's draws only**.
-3. Generate **fresh draws** on `calib`/`eval` for everything downstream.
+1. **Classification pass.** Draw `N_MAX` on **all** questions. These draws, and only
+   these, decide `in_U`, `p_hat`, `K_q`, the KM curve and `beta`.
+2. **Downstream pass.** Draw a second, independent `N_MAX` on the `calib`/`eval`
+   questions. Phase 2, Phase 4 and 6.7 run on these and never on the first pass.
+
+The held-out thing is the **pass**, not the question. `split` is a property of the
+question (4), so "use the `classify` split's draws" would decide `U` for the 30% of
+questions in that split using *every draw they have* — the same draws, under another
+name — and leave the `calib`/`eval` questions with no membership at all. Both passes
+therefore carry a `draw_set` column, and the pass name is salted into the seed so the
+second pass is genuinely fresh text rather than a replay of the first under a new label.
 
 Using the same draws to decide membership in `A` and to calibrate is selection on the
-outcome being certified and **voids the LTT guarantee**.
+outcome being certified and **voids the LTT guarantee**. It also makes the 6.7 `U` curve
+vacuous: "none of the first `k` draws was correct" holds *by construction* for every
+question the subset was defined to contain, so the observed frequency reads `1.0` at
+every `k` whatever VC claimed, and the resulting ratio — 1e16 at `k = 10` in one run — is
+arithmetic rather than a finding. Report `n_classify_draws` and `n_downstream_draws`
+alongside `beta`.
+
+The cost is one extra generation pass over `calib`/`eval`, about 1.6x total sampling at
+the default split shares. There is no cheaper honest version: reserving half of a single
+pass for classification would halve the budget that `beta` and the KM plateau are
+measured at, which is the one quantity Phase 4 is gated on.
 
 Call `U` what it is: *no admissible answer in `N_MAX` draws under `tau_star`*, not
 "unanswerable" in any absolute sense.
@@ -619,7 +638,11 @@ non-invariance are already a contribution.
 - [ ] `K_q` averaged over successes only (deletes hard questions)
 - [ ] KM curve still declining at `N_MAX` (censoring artifact reported as model property)
 - [ ] `alpha` chosen below `beta` (empty `Lambda_hat`, blank table)
-- [ ] Same draws used to classify `A` and to calibrate (voids guarantee)
+- [ ] Same draws used to classify `A` and to calibrate (voids guarantee, and pins every
+      `U` bin of the 6.7 curve at an observed frequency of 1.0)
+- [ ] `in_U` imputed from a question's own censoring where the partition did not cover it
+      — the fallback *is* the circularity, and a missing classification draw must stop the
+      run instead
 - [ ] `tau` selected and LTT run on the same split (voids guarantee)
 - [ ] `lambda_hat` selected on `calib` rather than `eval`
 - [ ] Sampling truncation left at the backend's defaults, so the decoder is not a

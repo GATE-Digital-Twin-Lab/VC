@@ -113,22 +113,35 @@ def semantic_entropy(cluster_ids) -> float:
 
 
 def cluster_frame(cfg: Config, answers: pd.DataFrame, nli=None) -> pd.DataFrame:
-    """Assign ``cluster_id`` per question and attach the frequency signal ``f``."""
+    """Assign ``cluster_id`` and the frequency signal ``f``, per (question, pass).
+
+    Grouped by ``draw_set`` as well as ``q_id`` where that column exists. A
+    question carries two independent passes of N_MAX draws (protocol 6.4);
+    pooling them would compute ``f`` and ``H_sem`` over 2*N_MAX draws that no
+    caller ever observes together, and would let the classification pass's
+    answers shift the diversity of the pass being certified.
+    """
     nli = nli if nli is not None else build_nli(cfg)
     thr = float(cfg.get("nli.entail_threshold"))
-    out = answers.sort_values(["q_id", "draw_idx"]).copy()
+    keys = ["q_id", "draw_set"] if "draw_set" in answers.columns else ["q_id"]
+    out = answers.sort_values(keys + ["draw_idx"]).copy()
     ids: list[int] = []
-    for _, g in out.groupby("q_id", sort=False):
+    for _, g in out.groupby(keys, sort=False):
         ids.extend(cluster_answers(list(g["answer"].astype(str)), nli, thr))
     out["cluster_id"] = ids
-    counts = out.groupby(["q_id", "cluster_id"])["draw_idx"].transform("size")
-    sizes = out.groupby("q_id")["draw_idx"].transform("size")
+    counts = out.groupby(keys + ["cluster_id"])["draw_idx"].transform("size")
+    sizes = out.groupby(keys)["draw_idx"].transform("size")
     out["f"] = counts / sizes          # self-consistency of this answer's cluster
     return out
 
 
 def question_diversity(answers: pd.DataFrame) -> pd.DataFrame:
-    """Per-question diversity summary: n_clusters, H_sem, largest cluster share."""
+    """Per-question diversity summary: n_clusters, H_sem, largest cluster share.
+
+    Pass a frame already restricted to ONE draw set. Grouping is by ``q_id``
+    alone, so a frame carrying both passes would summarise 2*N_MAX draws under a
+    single question id.
+    """
     rows = []
     for q_id, g in answers.groupby("q_id"):
         ids = g["cluster_id"].dropna().astype(int)

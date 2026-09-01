@@ -14,11 +14,18 @@ produced the answer, and once by teacher-forcing the same answer tokens under a
 clean prompt. Reporting only the first would confound token entropy with the VC
 instruction that was added to the context to elicit VC in the first place.
 
-Everything is cached by ``(model, dataset, q_id, draw_idx, T, prompt_variant,
-seed)``. Because ``seed`` is a hash of the other components rather than a
-counter, the whole key set is computable before a single token is generated --
-which is what lets ``resume=True`` skip work that is already on disk, instead of
-generating it and discarding it at write time.
+Generation runs in TWO passes (protocol 6.4). The ``classify`` pass draws
+``N_MAX`` on every question and is what decides ``in_U``; the ``downstream``
+pass draws a second, independent ``N_MAX`` on the calib/eval questions and is
+what everything certified is calibrated and evaluated on. The pass name is
+salted into the seed, so the two are genuinely different draws rather than the
+same text under two labels.
+
+Everything is cached by ``(model, dataset, q_id, draw_set, draw_idx, T,
+prompt_variant, seed)``. Because ``seed`` is a hash of the other components
+rather than a counter, the whole key set is computable before a single token is
+generated -- which is what lets ``resume=True`` skip work that is already on
+disk, instead of generating it and discarding it at write time.
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ from .backends import build_lm
 from .backends.base import SamplingParams
 from .config import Config
 from .parsing import parse_answer_and_vc, parse_audit_from_status, parse_vc_only
-from .schemas import (ANSWER_KEY, ANSWERS_SCHEMA, VC_PRE_KEY,
+from .schemas import (ANSWER_KEY, ANSWERS_SCHEMA, DRAW_SETS, VC_PRE_KEY,
                       VC_PRE_REPEATS_SCHEMA, empty_frame)
 from .store import Store
 
@@ -105,17 +112,30 @@ class Generator:
                                 params=self.sampling.replace(temperature=temperature))
 
     # -- cache keys, computable without generating -------------------------
+    def answer_seed(self, q_id: object, draw_idx: int, temperature: float,
+                    variant: str, draw_set: str) -> int:
+        """The pass name is part of the seed, not just a label on the row.
+
+        Without it the downstream pass would replay the classify pass token for
+        token -- same prompt, same seed, same decoder -- and the "fresh draws"
+        of 6.4 step 3 would be a copy under a second name.
+        """
+        return derive_seed(self.run_seed, draw_set, q_id, draw_idx, temperature,
+                           variant)
+
     def answer_keys(self, questions: pd.DataFrame, *, n_max: int,
-                    temperature: float, variant: str) -> pd.DataFrame:
+                    temperature: float, variant: str,
+                    draw_set: str = "classify") -> pd.DataFrame:
         rows = [{
             "model": self.model_name,
             "dataset": q["dataset"],
             "q_id": q["q_id"],
+            "draw_set": draw_set,
             "draw_idx": draw_idx,
             "temperature": temperature,
             "prompt_variant": variant,
-            "seed": derive_seed(self.run_seed, q["q_id"], draw_idx, temperature,
-                                variant),
+            "seed": self.answer_seed(q["q_id"], draw_idx, temperature, variant,
+                                     draw_set),
         } for _, q in questions.iterrows() for draw_idx in range(n_max)]
         return pd.DataFrame(rows, columns=list(ANSWER_KEY))
 
@@ -163,9 +183,10 @@ class Generator:
     def draw_answers(self, questions: pd.DataFrame, *, n_max: int | None = None,
                      temperature: float | None = None,
                      prompt_variant: str | None = None,
+                     draw_set: str = "classify",
                      store_per_position: bool = True,
                      resume: bool = False) -> pd.DataFrame:
-        """``N_MAX`` draws for every question.
+        """``N_MAX`` draws for every question, in one named pass.
 
         With ``resume=True`` the rows already in the shared cache are read back
         rather than re-generated, and the return value is their union with the
@@ -174,6 +195,8 @@ class Generator:
         Phase 1's output is written to the cache; the Phase 5 sweeps generate
         into frames that are never persisted, so there is nothing to resume from.
         """
+        if draw_set not in DRAW_SETS:
+            raise ValueError(f"draw_set must be one of {DRAW_SETS}, got {draw_set!r}")
         n_max = n_max if n_max is not None else int(self.cfg.get("generation.n_max"))
         temperature = (temperature if temperature is not None
                        else float(self.cfg.get("generation.temperature")))
@@ -184,7 +207,7 @@ class Generator:
         keep_frac = float(self.cfg.get("generation.token_stats.store_per_position_fraction"))
 
         keys = self.answer_keys(questions, n_max=n_max, temperature=temperature,
-                                variant=variant)
+                                variant=variant, draw_set=draw_set)
         cached = None
         if resume:
             todo = self.store.missing_answer_keys(keys)
@@ -201,13 +224,15 @@ class Generator:
             for draw_idx in range(n_max):
                 if (str(q["q_id"]), draw_idx) not in pending:
                     continue
-                seed = derive_seed(self.run_seed, q["q_id"], draw_idx, temperature, variant)
+                seed = self.answer_seed(q["q_id"], draw_idx, temperature, variant,
+                                        draw_set)
                 msgs = self._messages(spec, q)
                 gen = self._call(msgs, temperature=temperature, seed=seed)
                 parsed = parse_answer_and_vc(gen.text)
 
                 row: dict = {
                     "q_id": q["q_id"], "dataset": q["dataset"], "split": q["split"],
+                    "draw_set": draw_set,
                     "draw_idx": draw_idx, "answer": parsed.answer,
                     "vc_post": parsed.vc, "vc_post_raw": parsed.raw,
                     "temperature": temperature, "prompt_variant": variant,
@@ -222,6 +247,7 @@ class Generator:
                 if keep_positions:
                     per_position.append({
                         "q_id": q["q_id"], "dataset": q["dataset"],
+                        "draw_set": draw_set,
                         "draw_idx": draw_idx, "temperature": temperature,
                         "prompt_variant": variant, "seed": seed,
                         "model": self.model_name,
@@ -243,8 +269,13 @@ class Generator:
         audit = parse_audit_from_status(out["parse_status"])
         audit["prompt_variant"] = variant
         audit["temperature"] = temperature
+        audit["draw_set"] = draw_set
         audit["resume"] = dict(self.last_resume)
-        self.store.write_json(f"parse_audit__{variant}__T{temperature}", audit)
+        # The pass name is in the filename: without it the second pass would
+        # overwrite the first pass's audit, and the parse-failure rate is
+        # reported per pass.
+        self.store.write_json(
+            f"parse_audit__{variant}__T{temperature}__{draw_set}", audit)
         if per_position:
             # Append-only into the shared raw cache, not the run directory: these
             # arrays cost a decode to recreate, and a resumed run only produces
@@ -310,15 +341,42 @@ class Generator:
 def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame) -> dict:
     """Generate and cache everything Phase 1 owes downstream phases.
 
+    Two passes of N_MAX (protocol 6.4):
+
+    1. ``classify`` on EVERY question. These draws decide ``in_U``, ``p_hat``,
+       ``K_q`` and the whole survival picture, and nothing downstream is
+       calibrated or evaluated on them.
+    2. ``downstream`` on the ``generation.downstream_splits`` questions only.
+       Phase 2, Phase 4 and 6.7 run on these.
+
+    Deciding U with the draws that are later certified is selection on the
+    outcome being certified. It voids the LTT guarantee, and it makes the 6.7
+    U-curve tautological: "none of the first k draws was correct" is true by
+    construction for every question the subset was defined to contain, so the
+    observed frequency reads 1.0 at every k no matter what VC claimed.
+
     Resumable: re-running against a populated cache generates nothing and costs
     a parquet read, so a job that dies at hour nine of twelve restarts where it
     stopped rather than from zero.
     """
     gen = Generator(cfg, store)
 
-    answers = gen.draw_answers(questions, resume=True)
-    resume_answers = dict(gen.last_resume)
-    answers = store.append_answers(answers)
+    classify = gen.draw_answers(questions, draw_set="classify", resume=True)
+    resume_answers = {"classify": dict(gen.last_resume)}
+
+    downstream_splits = [str(s) for s in cfg.get("generation.downstream_splits")]
+    downstream_q = questions[questions["split"].isin(downstream_splits)]
+    if len(downstream_q):
+        downstream = gen.draw_answers(downstream_q, draw_set="downstream",
+                                      resume=True)
+        resume_answers["downstream"] = dict(gen.last_resume)
+    else:
+        downstream = empty_frame(ANSWERS_SCHEMA)
+        resume_answers["downstream"] = {"requested": 0, "generated": 0,
+                                        "reused_from_cache": 0}
+
+    answers = store.append_answers(
+        pd.concat([classify, downstream], ignore_index=True))
 
     pre = gen.draw_vc_pre(questions, resume=True)
     resume_pre = dict(gen.last_resume)
@@ -330,10 +388,15 @@ def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame) -> dict:
     return {
         "n_questions": int(len(questions)),
         "n_answers": int(len(answers)),
+        "n_classify_draws": int(len(classify)),
+        "n_downstream_draws": int(len(downstream)),
+        "downstream_splits": downstream_splits,
+        "n_downstream_questions": int(len(downstream_q)),
         "n_pre_repeats": int(len(pre)),
         "answer_key": list(ANSWER_KEY),
         "vc_pre_key": list(VC_PRE_KEY),
-        "resume": {"answers": resume_answers, "vc_pre_repeats": resume_pre},
+        "resume": {**{f"answers[{k}]": v for k, v in resume_answers.items()},
+                   "vc_pre_repeats": resume_pre},
     }
 
 

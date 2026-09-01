@@ -58,6 +58,22 @@ class PipelineState:
     notes: list[str] = field(default_factory=list)
 
 
+def _pass(answers: pd.DataFrame, name: str, split: str | None = None) -> pd.DataFrame:
+    """Rows from ONE generation pass (protocol 6.4), optionally one split.
+
+    Every phase states which pass it reads. ``classify`` decides U and the
+    survival picture; ``downstream`` is what Phase 2, Phase 4 and 6.7 are
+    calibrated and evaluated on. A phase that took the union would be averaging
+    over 2*N_MAX draws no deployed caller ever observes together, and -- for
+    anything conditioned on ``in_U`` -- would be measuring the draws that
+    defined the condition.
+    """
+    out = answers[answers["draw_set"] == name]
+    if split is not None:
+        out = out[out["split"] == split]
+    return out
+
+
 def _oracle(answers: pd.DataFrame) -> pd.DataFrame:
     """Known-truth column, available only under the simulated backend."""
     from .backends.mock import SEM_TAG
@@ -147,12 +163,16 @@ def step2_gate(state: PipelineState, *, simulate_labels: bool = False,
             "Fill the correct_human column (TRUE/FALSE), then re-run with\n"
             f"    vc_uq gate --labels {path}\n"
             "Rows are shuffled, so a partially labelled sheet still covers the "
-            "e_cos range. Only q_id, draw_idx and correct_human are read back. "
+            "e_cos range. Only q_id, draw_set, draw_idx and correct_human are "
+            "read back. "
             "Do not skip this: nothing downstream is interpretable through an "
             "unvalidated criterion.")
 
+    # On phase0.LABEL_KEY, not (q_id, draw_idx): the latter matches two rows
+    # per label since generation grew a second pass, which would duplicate every
+    # labelled pair and silently double-weight it in kappa and tau selection.
     labelled = labelled.merge(
-        scored[["q_id", "draw_idx", "correct_nli"]], on=["q_id", "draw_idx"], how="left")
+        scored[[*phase0.LABEL_KEY, "correct_nli"]], on=phase0.LABEL_KEY, how="left")
     gate = phase0.run_gate(cfg, store, labelled, scored, questions, embedder=embedder)
     state.gate = gate
 
@@ -214,8 +234,20 @@ def step4_survival(state: PipelineState) -> PipelineState:
                 f"{audit['unparsed_rate']:.1%} of comparisons; clustering treated "
                 "those as 'not the same answer'.")
 
-    qs = survival.question_stats(answers)
-    div = cluster.question_diversity(answers)
+    # Protocol 6.4: the draws that DECIDE membership in U are never the draws
+    # anything downstream is calibrated or evaluated on. Checked, not assumed --
+    # the failure is silent, and it looks like a spectacular result.
+    classify = _pass(answers, "classify")
+    downstream = _pass(answers, "downstream")
+    survival.assert_disjoint_draws(classify, downstream)
+    if classify.empty:
+        raise ValueError(
+            "no draws in the classification pass; U cannot be decided. Re-run "
+            "Phase 1 -- a cache written before generation.downstream_splits "
+            "existed carries no draw_set and will not load at all.")
+
+    qs = survival.question_stats(classify)
+    div = cluster.question_diversity(classify)
     # The question schema declares these columns as nullable placeholders; drop
     # them before merging so pandas does not produce _x/_y pairs.
     recomputed = [c for c in list(qs.columns) + list(div.columns) if c != "q_id"]
@@ -233,34 +265,55 @@ def step4_survival(state: PipelineState) -> PipelineState:
     part = survival.partition_U(answers)
     questions = questions.drop(columns=["in_U"], errors="ignore").merge(
         part[["q_id", "in_U"]], on="q_id", how="left")
-    questions["in_U"] = questions["in_U"].astype("boolean").fillna(
-        questions["censored"].astype("boolean"))
+    questions["in_U"] = questions["in_U"].astype("boolean")
+    # No fallback to `censored`. The classification pass covers every question by
+    # construction, so a null here means draws are missing -- and the fallback
+    # that used to fill it silently defined in_U from the question's OWN
+    # downstream draws, which is exactly the circularity 6.4 exists to prevent.
+    unlabelled = questions.loc[questions["in_U"].isna(), "q_id"]
+    if len(unlabelled):
+        raise ValueError(
+            f"{len(unlabelled)} questions have no classification draws, so U is "
+            f"undefined for them (e.g. {list(unlabelled[:5])}). Re-run Phase 1: "
+            "the classify pass must cover every question.")
 
     # h_tok is a per-answer quantity; the U-detection comparison needs it at
     # question level, using the same summary the stopping rule would see.
-    htok = answers.groupby("q_id")["h_tok_mean"].mean().rename("h_tok_mean").reset_index()
+    htok = (classify.groupby("q_id")["h_tok_mean"].mean()
+            .rename("h_tok_mean").reset_index())
     questions = questions.drop(columns=["h_tok_mean"], errors="ignore").merge(
         htok, on="q_id", how="left")
 
-    hz = survival.hazard(answers, int(cfg.get("phase3.hazard_max_k")))
+    hz = survival.hazard(classify, int(cfg.get("phase3.hazard_max_k")))
     budget = survival.budget_table(questions, cfg)
     u_det = survival.u_detection(questions, cfg)
     twobytwo = survival.diversity_2x2(questions)
 
-    eval_answers = answers[answers["split"] == "eval"]
+    # 6.7 runs on the DOWNSTREAM pass while in_U came from the classification
+    # pass, so "all k wrong" is a measurement on the U subset rather than its
+    # definition restated. Read together with the previous block: if these two
+    # ever came from the same draws, every U bin would report observed = 1.0.
+    eval_answers = _pass(answers, "downstream", split="eval")
     u_ids = set(questions.loc[questions["in_U"].astype("boolean").fillna(False), "q_id"])
-    curves = [survival.product_rule_curve(eval_answers, cfg, subset="all")]
-    for name, sub in (("U", eval_answers[eval_answers["q_id"].isin(u_ids)]),
-                      ("A", eval_answers[~eval_answers["q_id"].isin(u_ids)])):
-        if len(sub):
-            curves.append(survival.product_rule_curve(sub, cfg, subset=name))
-    curve = pd.concat([c for c in curves if len(c)], ignore_index=True)
-    diverg = survival.product_rule_divergence(curve) if len(curve) else pd.DataFrame()
+    if eval_answers.empty:
+        state.notes.append(
+            "6.7 product-rule curves skipped: the eval split has no downstream "
+            "draws. Add 'eval' to generation.downstream_splits.")
+        curve, diverg = pd.DataFrame(), pd.DataFrame()
+    else:
+        curves = [survival.product_rule_curve(eval_answers, cfg, subset="all")]
+        for name, sub in (("U", eval_answers[eval_answers["q_id"].isin(u_ids)]),
+                          ("A", eval_answers[~eval_answers["q_id"].isin(u_ids)])):
+            if len(sub):
+                curves.append(survival.product_rule_curve(sub, cfg, subset=name))
+        curve = pd.concat([c for c in curves if len(c)], ignore_index=True)
+        diverg = (survival.product_rule_divergence(curve) if len(curve)
+                  else pd.DataFrame())
 
     if cfg.get("judge.primary") == "cos" and state.gate is not None:
         taus = phase0.tau_sensitivity_values(cfg, state.gate.tau_star)
         store.write_table("phase3_beta_vs_tau",
-                          survival.beta_vs_tau(answers, "e_cos", taus))
+                          survival.beta_vs_tau(classify, "e_cos", taus))
 
     store.write_table("phase3_km", km)
     store.write_table("phase3_hazard", hz)
@@ -270,7 +323,13 @@ def step4_survival(state: PipelineState) -> PipelineState:
     store.write_table("phase3_product_rule_curve", curve)
     store.write_table("phase3_product_rule_divergence", diverg)
     store.write_json("phase3_summary", {
+        # Both describe the classification pass, and only that pass: beta is the
+        # KM plateau over its K_q, n_in_U counts the questions it never got
+        # right. Reported together so a reader can see they agree.
         "beta": beta, "km_flatness": flat,
+        "draw_set_for_U": "classify",
+        "n_classify_draws": int(len(classify)),
+        "n_downstream_draws": int(len(downstream)),
         "n_in_U": int(questions["in_U"].astype("boolean").fillna(False).sum()),
         "n_questions": int(len(questions)),
         "overlap": survival.overlap_statement(questions, "vc_pre", 0.8),
@@ -312,7 +371,9 @@ def step4_survival(state: PipelineState) -> PipelineState:
 
 def step5_descriptive(state: PipelineState) -> PipelineState:
     cfg, store = state.cfg, state.store
-    answers = state.answers[state.answers["split"] == "eval"]
+    # The downstream pass, not the classification pass: Phase 2 describes the
+    # draws the rest of the study is certified on.
+    answers = _pass(state.answers, "downstream", split="eval")
     questions = state.questions[state.questions["split"] == "eval"]
 
     hist_post = calibration.vc_histogram(answers, "vc_post")
@@ -372,7 +433,12 @@ def step6_clm(state: PipelineState) -> PipelineState:
         beta_eff = float(state.beta or 0.0)
 
     def traces_for(split: str):
-        sub = answers[(answers["split"] == split) & (answers["q_id"].isin(keep))]
+        # Downstream draws only. `keep` is derived from in_U, which the
+        # classification pass decided -- so restricting to A here conditions on
+        # information from draws these traces do not contain, which is what
+        # makes the LTT guarantee hold.
+        sub = _pass(answers, "downstream", split=split)
+        sub = sub[sub["q_id"].isin(keep)]
         qs = questions[questions["q_id"].isin(set(sub["q_id"]))]
         return build_traces(cfg, sub, qs, embedder=embedder) if len(sub) else []
 
@@ -428,12 +494,15 @@ def step6_clm(state: PipelineState) -> PipelineState:
                 f"{beta_all:.3f}, so no rule of any kind is certifiable there; "
                 "skipped rather than reported as a blank table.")
         for alpha in rob_alphas:
-            sub = answers[answers["split"].isin(["calib", "eval"])]
+            sub = _pass(answers, "downstream")
+            sub = sub[sub["split"].isin(["calib", "eval"])]
             all_q = questions[questions["q_id"].isin(set(sub["q_id"]))]
             rob_calib = build_traces(
-                cfg, answers[answers["split"] == "calib"], all_q, embedder=embedder)
+                cfg, _pass(answers, "downstream", split="calib"), all_q,
+                embedder=embedder)
             rob_eval = build_traces(
-                cfg, answers[answers["split"] == "eval"], all_q, embedder=embedder)
+                cfg, _pass(answers, "downstream", split="eval"), all_q,
+                embedder=embedder)
             if not rob_calib or not rob_eval:
                 continue
             res = run_phase4(cfg, rob_calib, rob_eval, beta=beta_all,
@@ -469,7 +538,7 @@ def step7_invariance_transfer(state: PipelineState) -> PipelineState:
     store.write_table("phase5_2_paraphrase_per_question", per_q)
     out["paraphrase"] = para
 
-    eval_answers = state.answers[state.answers["split"] == "eval"]
+    eval_answers = _pass(state.answers, "downstream", split="eval")
     table, tsum = transfer.transfer_study(cfg, eval_answers)
     store.write_table("phase6_transfer", table)
     compounding = transfer.isotonic_preserves_compounding(cfg, eval_answers)

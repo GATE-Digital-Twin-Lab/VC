@@ -322,7 +322,14 @@ def log_to_prob(log_p: float) -> float:
 
 
 def wilson_interval(k: int, n: int, ci: float = 0.95) -> tuple[float, float]:
-    """Binomial interval -- valid ONLY for question-level counts."""
+    """Binomial interval -- valid ONLY for question-level counts.
+
+    Clamped so the interval always brackets the point estimate. In exact
+    arithmetic it already does, but at p = 0 or p = 1 the algebra cancels to
+    exactly the bound and float64 lands a few ulps the wrong side of it -- which
+    reaches matplotlib as a negative error bar and aborts the figure, several
+    phases after the number itself was fine.
+    """
     if n == 0:
         return NAN, NAN
     from scipy.stats import norm
@@ -331,4 +338,4 @@ def wilson_interval(k: int, n: int, ci: float = 0.95) -> tuple[float, float]:
     denom = 1 + z**2 / n
     centre = (p + z**2 / (2 * n)) / denom
     half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
-    return float(centre - half), float(centre + half)
+    return float(min(max(0.0, centre - half), p)), float(max(min(1.0, centre + half), p))

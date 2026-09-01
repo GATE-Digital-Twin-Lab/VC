@@ -127,6 +127,26 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
         r.add("splits are by question, not by draw", bool((per_q <= 1).all()), "fatal",
               f"{int((per_q > 1).sum())} q_ids span multiple splits")
 
+    # -- U decided on draws that are never certified on (protocol 6.4) --
+    if _has(answers, "draw_set", "q_id", "draw_idx", "seed"):
+        cls = answers[answers["draw_set"] == "classify"]
+        dwn = answers[answers["draw_set"] == "downstream"]
+        key = ["q_id", "draw_idx", "seed"]
+        shared = (len(cls[key].merge(dwn[key], on=key, how="inner"))
+                  if len(cls) and len(dwn) else 0)
+        want_downstream = [str(s) for s in cfg.get("generation.downstream_splits")]
+        expected = (bool(want_downstream)
+                    and bool(len(answers[answers["split"].isin(want_downstream)])))
+        r.add("U is decided on draws that are never certified on",
+              bool(len(cls)) and (not expected or bool(len(dwn))) and shared == 0,
+              "fatal",
+              f"classification pass: {len(cls)} draws; downstream pass: {len(dwn)} "
+              f"draws; shared keys: {shared}. Deciding membership in U with the "
+              "draws that are later calibrated and evaluated on voids the LTT "
+              "guarantee, and pins every U bin of the 6.7 curve at an observed "
+              "frequency of 1.0 -- an enormous ratio that is only the subset's "
+              "definition restated.")
+
     # -- K_q censoring --
     if questions is not None and "censored" in questions.columns:
         n_cens = int(questions["censored"].fillna(False).astype(bool).sum())

@@ -127,19 +127,40 @@ def greedy_anchor(lm, cfg: Config, question_row: pd.Series) -> str:
     return parse_answer_and_vc(gen.text).answer
 
 
+def anchor_group_keys(answers: pd.DataFrame) -> list[str]:
+    """Anchors are per DRAW SET, not per question.
+
+    A question carries two independent sets of draws -- the classification pass
+    and the fresh downstream pass (protocol 6.4). The medoid of one is not the
+    medoid of the other, and an online caller only ever sees the set it is
+    running on, so pooling them would score every draw against an anchor that no
+    deployed rule could have computed.
+    """
+    return ["q_id", "draw_set"] if "draw_set" in answers.columns else ["q_id"]
+
+
 def build_anchors(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
                   space: EmbeddingSpace, lm=None) -> pd.Series:
-    """One anchor per question, built IDENTICALLY at calibration and test."""
+    """One anchor per (question, draw set), built IDENTICALLY at calib and test."""
     method = cfg.get("anchor.method")
+    keys = anchor_group_keys(answers)
     if method == "medoid":
-        return (answers.sort_values("draw_idx").groupby("q_id")["answer"]
+        return (answers.sort_values("draw_idx").groupby(keys, sort=False)["answer"]
                 .apply(lambda s: medoid_anchor(list(s), space)))
     if method == "greedy":
         if lm is None:
             from .backends import build_lm
             lm = build_lm(cfg)
         idx = questions.set_index("q_id")
-        return pd.Series({q: greedy_anchor(lm, cfg, idx.loc[q]) for q in idx.index})
+        base = {q: greedy_anchor(lm, cfg, idx.loc[q]) for q in idx.index}
+        if len(keys) == 1:
+            return pd.Series(base)
+        # A greedy decode does not depend on the draws, so both passes get the
+        # same anchor -- but it is still indexed by pass, so every caller can map
+        # rows the same way whichever method is configured.
+        combos = answers[keys].drop_duplicates()
+        return pd.Series([base.get(q) for q in combos["q_id"]],
+                         index=pd.MultiIndex.from_frame(combos))
     raise ValueError(f"unknown anchor.method {method!r}; must be medoid or greedy")
 
 
@@ -160,8 +181,14 @@ def score_answers(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
         space = build_embedding_space(cfg, texts + missing, embedder=embedder)
 
     out = answers.copy()
+    keys = anchor_group_keys(out)
+    amap = anchors.to_dict()
     a_star_texts = out["q_id"].map(q_idx["a_star"].astype(str))
-    anchor_texts = out["q_id"].map(anchors)
+    if len(keys) == 1:
+        anchor_texts = out["q_id"].map(amap)
+    else:
+        anchor_texts = pd.Series(
+            [amap.get(k) for k in zip(*(out[c] for c in keys))], index=out.index)
 
     emb_a = space.get(out["answer"].astype(str))
     emb_star = space.get(a_star_texts)
@@ -172,13 +199,25 @@ def score_answers(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
 
     if bool(cfg.get("embedding.postprocess.rank_transform_s")):
         # Only the ordering of s matters downstream, and ranking within a split
-        # restores dynamic range that anisotropy compresses away.
-        out["s_anchor_rank"] = out.groupby("split")["s_anchor"].rank(pct=True)
+        # restores dynamic range that anisotropy compresses away. Ranked within
+        # the draw set too: the two passes are scored against different anchors,
+        # so pooling them would rank each row against distances it was never
+        # comparable to.
+        rank_keys = ["split", "draw_set"] if "draw_set" in out.columns else ["split"]
+        out["s_anchor_rank"] = out.groupby(rank_keys)["s_anchor"].rank(pct=True)
     else:
         out["s_anchor_rank"] = out["s_anchor"]
 
     questions_out = questions.copy()
-    questions_out["anchor"] = questions_out["q_id"].map(anchors)
+    if len(keys) == 1:
+        questions_out["anchor"] = questions_out["q_id"].map(amap)
+    else:
+        # The question table holds ONE anchor per question for reporting: the
+        # classify pass's, since that is the only draw set every question has
+        # and the one the Phase 0 dispersion diagnostics describe. Per-row
+        # scoring above already used each row's own pass.
+        cls = {q: t for (q, ds), t in amap.items() if ds == "classify"}
+        questions_out["anchor"] = questions_out["q_id"].map(cls)
     return out, questions_out
 
 

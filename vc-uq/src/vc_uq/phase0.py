@@ -28,6 +28,14 @@ from .config import Config
 from .stats import NAN as NAN_, auroc, cohens_kappa
 from .store import Store
 
+# A hand label identifies ONE answer, and (q_id, draw_idx) stopped identifying
+# one the moment generation grew a second pass (protocol 6.4): draw 3 of the
+# classification pass and draw 3 of the downstream pass are different text with
+# the same pair. Keying without draw_set would attach one human verdict to both,
+# silently, and tau_star is selected against exactly these labels.
+LABEL_KEY = ["q_id", "draw_set", "draw_idx"]
+
+
 
 @dataclass
 class GateResult:
@@ -83,6 +91,7 @@ def build_label_sheet(cfg: Config, answers: pd.DataFrame,
     question_text = questions.set_index("q_id")["question"]
     return pd.DataFrame({
         "q_id": sheet["q_id"].astype(str).to_numpy(),
+        "draw_set": sheet["draw_set"].astype(str).to_numpy(),
         "draw_idx": sheet["draw_idx"].astype(int).to_numpy(),
         "dataset": sheet["dataset"].to_numpy(),
         "stratum": sheet["stratum"].to_numpy(),
@@ -151,11 +160,13 @@ def load_hand_labels(cfg: Config, sheet: pd.DataFrame,
     stratifying was to sample the boundary rather than the easy mass.
     """
     raw = pd.read_csv(path)
-    missing = {"q_id", "draw_idx", "correct_human"} - set(raw.columns)
+    missing = {*LABEL_KEY, "correct_human"} - set(raw.columns)
     if missing:
         raise ValueError(
             f"{path}: missing column(s) {sorted(missing)}. Fill in the sheet that "
-            "`vc_uq gate` wrote rather than building a CSV by hand.")
+            "`vc_uq gate` wrote rather than building a CSV by hand -- draw_set is "
+            "part of the key, and without it a label cannot be matched to the "
+            "answer it was written for.")
 
     parsed = raw["correct_human"].map(_parse_label)
     # fillna BEFORE the membership test: the string accessors propagate NA, so
@@ -168,22 +179,24 @@ def load_hand_labels(cfg: Config, sheet: pd.DataFrame,
 
     csv = pd.DataFrame({
         "q_id": raw["q_id"].astype(str),
+        "draw_set": raw["draw_set"].astype(str),
         "draw_idx": pd.to_numeric(raw["draw_idx"], errors="coerce").astype("Int64"),
         "correct_human": parsed,
     }).dropna(subset=["draw_idx"])
     csv["draw_idx"] = csv["draw_idx"].astype(int)
-    n_duplicate_keys = int(csv.duplicated(subset=["q_id", "draw_idx"]).sum())
-    csv = csv.drop_duplicates(subset=["q_id", "draw_idx"], keep="last")
+    n_duplicate_keys = int(csv.duplicated(subset=LABEL_KEY).sum())
+    csv = csv.drop_duplicates(subset=LABEL_KEY, keep="last")
     labelled_csv = csv[csv["correct_human"].notna()]
 
     base = sheet.drop(columns=["correct_human"]).copy()
     base["q_id"] = base["q_id"].astype(str)
+    base["draw_set"] = base["draw_set"].astype(str)
     base["draw_idx"] = base["draw_idx"].astype(int)
-    merged = base.merge(labelled_csv, on=["q_id", "draw_idx"], how="left")
+    merged = base.merge(labelled_csv, on=LABEL_KEY, how="left")
 
-    base_keys = set(zip(base["q_id"], base["draw_idx"]))
-    unjoined = [f"{q}#{d}" for q, d in zip(labelled_csv["q_id"], labelled_csv["draw_idx"])
-                if (q, d) not in base_keys]
+    base_keys = set(zip(*(base[c] for c in LABEL_KEY)))
+    unjoined = [f"{q}#{s}#{d}" for q, s, d in zip(*(labelled_csv[c] for c in LABEL_KEY))
+                if (q, s, d) not in base_keys]
 
     per_stratum = (merged.assign(_lab=merged["correct_human"].notna())
                    .groupby("stratum")
@@ -256,9 +269,9 @@ def simulate_human_labels(sheet: pd.DataFrame, answers: pd.DataFrame,
     """
     if oracle_col not in answers.columns:
         raise ValueError(f"{oracle_col} is absent; simulated labels need a known truth")
-    key = answers.set_index(["q_id", "draw_idx"])[oracle_col]
+    key = answers.set_index(LABEL_KEY)[oracle_col]
     rng = np.random.default_rng(seed)
-    truth = [bool(key.loc[(q, d)]) for q, d in zip(sheet["q_id"], sheet["draw_idx"])]
+    truth = [bool(key.loc[k]) for k in zip(*(sheet[c] for c in LABEL_KEY))]
     flips = rng.random(len(truth)) < error_rate
     out = sheet.copy()
     out["correct_human"] = [bool(t) ^ bool(f) for t, f in zip(truth, flips)]

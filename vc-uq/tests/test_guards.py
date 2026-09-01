@@ -46,24 +46,36 @@ def test_conform_refuses_missing_required_column():
         conform(pd.DataFrame({"q_id": ["a"]}), ANSWERS_SCHEMA, name="answers")
 
 
-def test_partition_U_refuses_to_use_calibration_draws():
-    """U membership must come from the classify split and nothing else."""
-    df = pd.DataFrame([{"q_id": "a", "split": "calib", "correct": False,
-                        "draw_idx": 0}])
+def test_partition_U_refuses_to_run_without_classification_draws():
+    """No classification pass means U is undefined, not empty."""
+    df = pd.DataFrame([{"q_id": "a", "split": "calib", "draw_set": "downstream",
+                        "correct": False, "draw_idx": 0}])
     with pytest.raises(ValueError, match="classify"):
         partition_U(df)
 
 
-def test_partition_U_uses_only_classify_draws():
+def test_partition_U_keys_on_the_pass_not_the_split():
+    """The held-out thing is the PASS, not the question.
+
+    Splits are by q_id, so filtering on split == "classify" decides U for the
+    classify-split questions using every draw they have -- the same draws, under
+    another name -- and leaves the calib/eval questions unlabelled, which is how
+    the fallback to `censored` crept in and made 6.7's U curve tautological.
+    """
     df = pd.DataFrame([
-        {"q_id": "a", "split": "classify", "draw_idx": 0, "correct": False},
-        {"q_id": "a", "split": "classify", "draw_idx": 1, "correct": False},
-        # A correct answer in another split must NOT rescue the question from U:
-        # membership is decided on the classify draws alone.
-        {"q_id": "a", "split": "eval", "draw_idx": 0, "correct": True},
+        # An eval-split question: it has both passes, and only the first counts.
+        {"q_id": "a", "split": "eval", "draw_set": "classify",
+         "draw_idx": 0, "correct": False},
+        {"q_id": "a", "split": "eval", "draw_set": "classify",
+         "draw_idx": 1, "correct": False},
+        {"q_id": "a", "split": "eval", "draw_set": "downstream",
+         "draw_idx": 0, "correct": True},
     ])
     out = partition_U(df)
-    assert bool(out.loc[out["q_id"] == "a", "in_U"].iloc[0])
+    assert list(out["q_id"]) == ["a"], "every question gets a verdict, not just 30%"
+    assert bool(out["in_U"].iloc[0]), \
+        "a correct DOWNSTREAM draw must not rescue the question from U"
+    assert int(out["n_classify_draws"].iloc[0]) == 2
 
 
 def test_km_flatness_flags_a_still_declining_curve(cfg):
@@ -348,7 +360,7 @@ def test_rows_that_match_nothing_are_reported_not_silently_dropped(cfg, tmp_path
 
     out, report = phase0.load_hand_labels(cfg2, sheet, path)
     assert report["n_unjoined"] == 1
-    assert "q_that_does_not_exist#0" in report["unjoined_examples"]
+    assert "q_that_does_not_exist#classify#0" in report["unjoined_examples"]
     assert any("matched no pair" in w for w in report["warnings"])
 
 
@@ -718,7 +730,8 @@ def test_parse_audit_covers_cached_rows_not_just_new_ones(cfg):
 
     variant = c.get("generation.prompt_variant_post")
     T = c.get("generation.temperature")
-    audit = _json.loads((store.tables_dir / f"parse_audit__{variant}__T{T}.json")
+    audit = _json.loads((store.tables_dir
+                         / f"parse_audit__{variant}__T{T}__classify.json")
                         .read_text(encoding="utf-8"))
     assert audit["n"] == 3 * len(questions)
     assert audit["resume"]["generated"] == 0
@@ -1601,3 +1614,359 @@ def test_the_per_phase_workflow_carries_its_state_forward(cfg):
     assert reloaded["cluster_id"].notna().all(), "cluster_id must not be all null"
     assert reloaded.groupby("q_id")["cluster_id"].nunique().max() > 1, \
         "every draw landing in one cluster is the failure this guards against"
+
+
+# --------------------------------------------------------------------------
+# Two generation passes (protocol 6.4): U is decided on draws nothing is
+# certified on. Without this the 6.7 U-curve is its own definition restated.
+# --------------------------------------------------------------------------
+
+def _two_pass_cfg(cfg):
+    return cfg.with_overrides(["dataset.triviaqa.n_questions=24",
+                               "dataset.fabricated.n_questions=8",
+                               "generation.n_max=6", "phase0.n_hand_label=40",
+                               "phase0.stratify_bins=3",
+                               "phase0.null_band.n_mismatched_pairs=200"])
+
+
+def test_the_second_pass_is_fresh_draws_not_a_relabelled_copy(cfg):
+    """"Fresh draws" has to mean different tokens, not a second name.
+
+    The prompt, the decoder and the model are identical between the passes, so
+    the ONLY thing that can make them independent is the seed. If the pass name
+    is not salted in, the downstream pass replays the classification pass token
+    for token and the disjointness is cosmetic.
+    """
+    from vc_uq.generate import Generator
+    from vc_uq.datasets import build_questions
+    from vc_uq.store import Store
+
+    c = _two_pass_cfg(cfg)
+    store = Store(c)
+    gen = Generator(c, store)
+    qs = build_questions(c)
+
+    a = gen.answer_keys(qs, n_max=3, temperature=0.8, variant="vc_post_v1",
+                        draw_set="classify")
+    b = gen.answer_keys(qs, n_max=3, temperature=0.8, variant="vc_post_v1",
+                        draw_set="downstream")
+
+    assert len(a) == len(b) == 3 * len(qs)
+    assert set(a["seed"]).isdisjoint(set(b["seed"])), \
+        "the two passes must not share a single seed"
+    # And the key really does tell them apart, so the cache cannot merge them.
+    merged = a.merge(b, on=["q_id", "draw_idx", "seed"], how="inner")
+    assert merged.empty
+
+
+def test_phase1_runs_both_passes_over_the_right_questions(cfg):
+    from vc_uq.datasets import build_questions
+    from vc_uq.generate import run_phase1
+    from vc_uq.store import Store
+
+    c = _two_pass_cfg(cfg)
+    store = Store(c)
+    qs = build_questions(c)
+    info = run_phase1(c, store, qs)
+
+    answers = store.read_answers()
+    cls = answers[answers["draw_set"] == "classify"]
+    dwn = answers[answers["draw_set"] == "downstream"]
+
+    assert set(cls["q_id"]) == set(qs["q_id"]), \
+        "the classification pass must cover EVERY question -- in_U has no fallback"
+    assert set(dwn["q_id"]) == set(qs.loc[qs["split"].isin(["calib", "eval"]), "q_id"])
+    assert info["n_downstream_draws"] > 0
+    assert set(dwn["split"]) <= {"calib", "eval"}
+
+
+def test_step4_reads_the_classification_pass_and_6_7_reads_the_downstream_pass(cfg):
+    """Which frame reaches which analysis is the whole guarantee.
+
+    Recorded rather than inferred from the numbers: the failure mode is that
+    6.7 is handed the draws that defined its own subset, and that shows up as a
+    spectacular result (observed = 1.0 in every U bin) rather than as an error.
+    """
+    from vc_uq import pipeline, survival
+    from vc_uq.datasets import build_questions
+    from vc_uq.store import Store
+
+    c = _two_pass_cfg(cfg)
+    store = Store(c)
+    state = pipeline.PipelineState(cfg=c, store=store)
+    state.questions = build_questions(c)
+    state = pipeline.step3_generate(state)
+    state = pipeline.step2_gate(state, simulate_labels=True)
+
+    seen = {"partition": [], "product": []}
+    real_partition, real_product = survival.partition_U, survival.product_rule_curve
+
+    def spy_partition(answers, **kw):
+        out = real_partition(answers, **kw)
+        seen["partition"].append(answers)
+        return out
+
+    def spy_product(answers, cfg_, **kw):
+        seen["product"].append(answers)
+        return real_product(answers, cfg_, **kw)
+
+    survival.partition_U, survival.product_rule_curve = spy_partition, spy_product
+    try:
+        state = pipeline.step4_survival(state)
+    finally:
+        survival.partition_U, survival.product_rule_curve = real_partition, real_product
+
+    assert seen["product"], "6.7 never ran"
+    for frame in seen["product"]:
+        assert set(frame["draw_set"]) == {"downstream"}, \
+            "6.7 must never see the draws that decided U"
+        assert set(frame["split"]) == {"eval"}
+
+    # And U itself was decided on the other pass, for every question.
+    part = real_partition(state.answers)
+    assert set(part["q_id"]) == set(state.questions["q_id"])
+    assert state.questions["in_U"].notna().all(), "no question falls back to censored"
+
+
+def test_u_membership_is_falsifiable_by_the_draws_that_measure_it(cfg):
+    """The 6.7 U-curve must be able to come out below 1.0.
+
+    A question can be never-correct in the classification pass and still get a
+    correct answer downstream. Under the old single-pass partition that was
+    impossible by construction -- "none of the first k was correct" held for
+    every member of the subset at every k -- so the observed frequency read 1.0
+    whatever VC had claimed, and the resulting 1e16 ratio was arithmetic, not a
+    finding.
+    """
+    import pandas as pd
+
+    from vc_uq.survival import partition_U, product_rule_curve
+
+    rows = []
+    for i in range(4):
+        rows.append({"q_id": "q0", "dataset": "d", "split": "eval",
+                     "draw_set": "classify", "draw_idx": i,
+                     "correct": False, "vc_post": 0.8})
+    for i in range(4):
+        rows.append({"q_id": "q0", "dataset": "d", "split": "eval",
+                     "draw_set": "downstream", "draw_idx": i,
+                     "correct": i == 2, "vc_post": 0.8})
+    df = pd.DataFrame(rows)
+
+    assert bool(partition_U(df)["in_U"].iloc[0]), \
+        "never correct in the classification pass, so it is in U"
+
+    curve = product_rule_curve(df[df["draw_set"] == "downstream"],
+                               cfg.with_overrides(["phase3.product_rule.k_values=[2,3]"]),
+                               subset="U")
+    obs = dict(zip(curve["k"], curve["observed"]))
+    assert obs[2] == 1.0, "the first two downstream draws really were both wrong"
+    assert obs[3] == 0.0, "the third was right -- measured, not assumed"
+
+
+def test_the_product_rule_curve_reports_what_it_dropped(cfg):
+    """A question dropped for an unparsed VC is not a random question.
+
+    The draws that fail to state a confidence are plausibly the ones the model
+    is least sure of, so the denominator has to travel with the bin frequency.
+    """
+    import pandas as pd
+
+    from vc_uq.survival import product_rule_curve
+
+    rows = []
+    for q, vc in (("keep", 0.8), ("unparsed", None)):
+        for i in range(3):
+            rows.append({"q_id": q, "dataset": "d", "split": "eval",
+                         "draw_set": "downstream", "draw_idx": i,
+                         "correct": False,
+                         "vc_post": vc if not (q == "unparsed" and i == 1) else None})
+    rows.append({"q_id": "short", "dataset": "d", "split": "eval",
+                 "draw_set": "downstream", "draw_idx": 0, "correct": False,
+                 "vc_post": 0.5})
+    df = pd.DataFrame(rows)
+
+    curve = product_rule_curve(df, cfg.with_overrides(
+        ["phase3.product_rule.k_values=[3]"]), subset="all")
+    row = curve.iloc[0]
+    assert int(row["n_questions_binned"]) == 1
+    assert int(row["n_dropped_unparsed_vc"]) == 1
+    assert int(row["n_dropped_short_of_k"]) == 1
+    assert row["frac_dropped_unparsed_vc"] == pytest.approx(1 / 3)
+
+
+def test_the_two_passes_are_clustered_and_anchored_separately(cfg):
+    """f, H_sem and the medoid describe ONE set of draws.
+
+    Pooling the passes would compute them over 2*N_MAX draws that no caller ever
+    observes together, and would let the classification pass shift the diversity
+    of the pass being certified.
+    """
+    import pandas as pd
+
+    from vc_uq.cluster import cluster_frame
+    from vc_uq.judge import anchor_group_keys
+
+    rows = ([{"q_id": "q0", "draw_set": "classify", "draw_idx": i, "answer": a}
+             for i, a in enumerate(["Lisbon", "Lisbon", "Lisbon", "Lisbon"])]
+            + [{"q_id": "q0", "draw_set": "downstream", "draw_idx": i, "answer": a}
+               for i, a in enumerate(["Madrid", "Porto", "Rome", "Oslo"])])
+    out = cluster_frame(cfg, pd.DataFrame(rows), nli=_PairJudge({}))
+
+    cls = out[out["draw_set"] == "classify"]
+    dwn = out[out["draw_set"] == "downstream"]
+    assert (cls["f"] == 1.0).all(), "the classify pass is unanimous on its own"
+    assert dwn["f"].tolist() == pytest.approx([0.25] * 4), \
+        "the downstream pass is four distinct answers on its own"
+
+    assert anchor_group_keys(pd.DataFrame(rows)) == ["q_id", "draw_set"]
+    assert anchor_group_keys(pd.DataFrame({"q_id": ["a"]})) == ["q_id"]
+
+
+def test_hand_labels_identify_one_answer_not_two(cfg):
+    """(q_id, draw_idx) stopped being a key when the second pass arrived."""
+    import pandas as pd
+
+    from vc_uq.phase0 import LABEL_KEY, simulate_human_labels
+
+    assert LABEL_KEY == ["q_id", "draw_set", "draw_idx"]
+    answers = pd.DataFrame([
+        {"q_id": "q0", "draw_set": "classify", "draw_idx": 0, "correct_oracle": True},
+        {"q_id": "q0", "draw_set": "downstream", "draw_idx": 0, "correct_oracle": False},
+    ])
+    sheet = pd.DataFrame([{"q_id": "q0", "draw_set": "downstream", "draw_idx": 0}])
+    out = simulate_human_labels(sheet, answers, error_rate=0.0)
+    assert list(out["correct_human"]) == [False], \
+        "the label must follow the pass it was written for"
+
+
+def test_pitfall_reports_a_missing_or_shared_second_pass(cfg):
+    import pandas as pd
+
+    from vc_uq.pitfalls import run_checks
+
+    name = "U is decided on draws that are never certified on"
+
+    def frame(sets):
+        return pd.DataFrame([{"q_id": "q0", "split": "eval", "draw_set": s,
+                              "draw_idx": i, "seed": seed}
+                             for s, i, seed in sets])
+
+    clean = frame([("classify", 0, 1), ("downstream", 0, 2)])
+    assert next(c for c in run_checks(cfg, answers=clean).checks
+                if c.name == name).passed is True
+
+    # Same seed on both sides: the passes are the same draws under two labels.
+    shared = frame([("classify", 0, 1), ("downstream", 0, 1)])
+    bad = next(c for c in run_checks(cfg, answers=shared).checks if c.name == name)
+    assert bad.passed is False and bad.severity == "fatal"
+
+    # Second pass missing entirely, while eval questions exist.
+    only_one = frame([("classify", 0, 1)])
+    bad2 = next(c for c in run_checks(cfg, answers=only_one).checks if c.name == name)
+    assert bad2.passed is False
+
+
+def test_wilson_interval_always_brackets_the_estimate():
+    """At p = 0 or 1 the algebra cancels to the bound and float64 overshoots.
+
+    It reaches matplotlib as a negative error bar and aborts the figure several
+    phases after the number itself was fine.
+    """
+    from vc_uq.stats import wilson_interval
+
+    for n in (1, 3, 7, 20, 100):
+        for k in (0, n):
+            lo, hi = wilson_interval(k, n)
+            p = k / n
+            assert 0.0 <= lo <= p <= hi <= 1.0, (k, n, lo, hi)
+
+
+def _state_ready_for_survival(cfg):
+    """A pipeline state generated and gated, one step short of Phase 3."""
+    from vc_uq import pipeline
+    from vc_uq.datasets import build_questions
+    from vc_uq.store import Store
+
+    c = _two_pass_cfg(cfg)
+    state = pipeline.PipelineState(cfg=c, store=Store(c))
+    state.questions = build_questions(c)
+    state = pipeline.step3_generate(state)
+    return pipeline.step2_gate(state, simulate_labels=True)
+
+
+def test_a_question_with_no_classification_draws_stops_the_run(cfg):
+    """The fallback this replaced was the whole bug.
+
+    `in_U` used to be filled from the question's own `censored` flag whenever
+    the partition did not cover it -- which was 70% of questions, since splits
+    are by q_id. That fallback reads the downstream draws to decide the
+    condition those same draws are then measured under. Missing classification
+    draws must stop the run, not be quietly imputed.
+    """
+    from vc_uq import pipeline
+
+    state = _state_ready_for_survival(cfg)
+    victim = state.answers["q_id"].iloc[0]
+    state.answers = state.answers[
+        ~((state.answers["q_id"] == victim)
+          & (state.answers["draw_set"] == "classify"))]
+
+    with pytest.raises(ValueError, match="classification draws"):
+        pipeline.step4_survival(state)
+
+
+def test_two_passes_sharing_a_draw_stop_the_run(cfg):
+    """assert_disjoint_draws runs on every run, not as documentation.
+
+    If the passes ever coincide, nothing raises on its own: the 6.7 U-curve
+    simply reports an observed frequency of 1.0 in every bin, which reads as a
+    spectacular result and is only the subset's definition restated.
+    """
+    import pandas as pd
+
+    from vc_uq import pipeline
+
+    state = _state_ready_for_survival(cfg)
+    cls = state.answers[state.answers["draw_set"] == "classify"]
+    # The same draw, relabelled as the other pass: identical q_id/draw_idx/seed.
+    forged = cls.head(3).copy()
+    forged["draw_set"] = "downstream"
+    state.answers = pd.concat(
+        [state.answers[state.answers["draw_set"] == "classify"], forged],
+        ignore_index=True)
+
+    with pytest.raises(ValueError, match="both the classification pass"):
+        pipeline.step4_survival(state)
+
+
+def test_censoring_and_U_are_the_same_question_answered_once(cfg):
+    """`censored` and `in_U` must be decided by the SAME frame.
+
+    Both mean "no correct answer in the classification pass", so they are the
+    same column and phase3 reports beta and n_in_U as commensurable numbers. The
+    old bug was that they were not: question_stats ran on every draw while the
+    partition ran on the classify SPLIT, which left 70% of questions unlabelled
+    and let `in_U` be filled from `censored` -- that is, from the question's own
+    downstream draws, the ones 6.7 then measured it against.
+
+    Holding this identity is what makes that fallback unreachable rather than
+    merely absent: when the partition does not cover a question, neither does
+    question_stats, so there is nothing to fall back to and the run stops.
+    """
+    import json as _json
+
+    from vc_uq import pipeline
+
+    state = pipeline.step4_survival(_state_ready_for_survival(cfg))
+    q = state.questions
+
+    assert q["in_U"].notna().all() and q["censored"].notna().all()
+    assert list(q["in_U"].astype(bool)) == list(q["censored"].astype(bool)), \
+        "in_U and censored disagree, so one of them is reading the wrong pass"
+
+    summary = _json.loads((state.store.tables_dir / "phase3_summary.json")
+                          .read_text(encoding="utf-8"))
+    assert summary["draw_set_for_U"] == "classify"
+    assert summary["n_in_U"] == int(q["censored"].astype(bool).sum()), \
+        "beta and n_in_U are reported side by side; they must describe one thing"
