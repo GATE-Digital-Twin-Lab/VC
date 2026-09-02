@@ -454,7 +454,8 @@ def step6_clm(state: PipelineState) -> PipelineState:
         res = run_phase4(cfg, calib_traces, eval_traces, beta=beta_eff,
                          alpha=float(alpha), n_max=n_max)
         per_alpha[str(alpha)] = {"feasibility": res.feasibility,
-                                 "vacuity": res.vacuity, "notes": res.notes}
+                                 "vacuity": res.vacuity, "notes": res.notes,
+                                 "ltt": res.ltt_meta, "traces": res.trace_audit}
         if len(res.headline):
             all_rows.append(res.headline.assign(alpha=float(alpha)))
         state.notes.extend(res.notes)
@@ -515,6 +516,7 @@ def step6_clm(state: PipelineState) -> PipelineState:
         store.write_json("phase4_robustness_summary", rob_meta)
     store.write_json("phase4_summary", {"beta_used": beta_eff,
                                         "restricted_to_A": bool(cfg.get("phase4.restrict_to_A")),
+                                        "quality_score": cfg.get("phase4.quality_score"),
                                         "per_alpha": per_alpha})
     state.results["step6_clm"] = {"headline": headline.to_dict("records"),
                                   "per_alpha": per_alpha}

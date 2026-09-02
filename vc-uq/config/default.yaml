@@ -246,20 +246,52 @@ phase4:
   # any kind is certifiable there and the table would be blank by arithmetic.
   robustness_alphas: [0.2, 0.3]
   grid:
-    lambda_qual: {start: 0.0, stop: 1.0, num: 10}
-    lambda_div:  {start: 0.0, stop: 0.6, num: 10}
-    # Only `num` applies to lambda_stop: the rules' statistics live on
-    # incompatible scales (a log-probability, an entropy in nats, a draw
-    # count), so each rule's grid is quantiles of its own observed statistic
-    # rather than a shared numeric range. See clm.rule_stop_grid.
-    lambda_stop: {num: 10}
+    # lambda_qual, lambda_div and every rule's lambda_stop EXCEPT vc_product are
+    # searched over [0, 1]. Each score is rescaled to the unit interval first
+    # (see clm.RULE_UNITS and clm.QUALITY_SCORES), so a threshold reads directly
+    # and is comparable across rules and models rather than being a number on
+    # whatever scale a particular statistic happened to have.
+    #
+    # vc_product is the exception, and deliberately so: its lambda_stop is a
+    # LOG-probability in nats, on the same scale as the Lambda_k it is compared
+    # against. The claim compounds, so the interesting thresholds span orders of
+    # magnitude -- as a probability they would bunch against 0 and be unreadable,
+    # while -5 nats and -20 nats are two legible numbers. This is also the scale
+    # 6.7 reports the product-rule gap on, so the two are directly comparable.
+    #
+    # Watch phase4_summary's `n_families_distinct`. delta is divided by the
+    # number of (lambda_qual, lambda_div) cells, so grid points that behave
+    # identically are lost power, not merely wasted compute.
+    lambda_qual: {num: 10}
+    lambda_div:  {num: 10}
+    lambda_stop:
+      num: 10
+      # vc_product only. Its grid spans log(product_floor) .. 0 nats, plus -inf
+      # meaning "never stop early" -- the conservative anchor the fixed sequence
+      # starts from, and the only grid point guaranteed to be reachable at any
+      # N_MAX. Lower this if N_MAX is large enough that the strictest finite
+      # threshold still fires early.
+      product_floor: 1.0e-6
+  # Every rule reads the RETAINED set C(q), never the raw draw stream: an
+  # answer the quality or diversity gate rejected cannot be the evidence that
+  # ends sampling. That is what makes lambda_qual and lambda_div matter -- a
+  # stricter gate admits less, the statistic advances more slowly, and the rule
+  # spends more draws to reach the same threshold.
+  #
+  #   vc_product     sum log(1 - vc) over C(q) falls to lambda_stop
+  #   vc_max         the most confident answer IN C(q) reaches lambda_stop
+  #   token_entropy  the lowest-entropy answer in C(q) reaches lambda_stop
+  #   fixed_k        |C(q)| reaches lambda_stop * N_MAX -- the null baseline
+  #
+  # vc_first and vc_prehoc are gone: both fix the budget from a single number
+  # (the first draw's VC, or a pre-hoc estimate) and cannot read C(q) at all, so
+  # they belong to a different family from everything here. min_token_p is gone
+  # too -- token_entropy already carries the token-level mechanism, and two
+  # near-identical baselines cost multiplicity without adding an argument.
   stop_rules:
     - vc_product
     - vc_max
-    - vc_first
-    - vc_prehoc
     - token_entropy
-    - min_token_p
     - fixed_k          # mandatory null baseline
   # self_consistency and semantic_entropy are NOT here. They are diversity
   # statistics over a set of draws, and at k = 1 they are undefined rather than
@@ -270,7 +302,25 @@ phase4:
   # reported DESCRIPTIVELY instead: `f` per answer in the Phase 2 AUROC
   # comparison, H_sem and largest_cluster_share per question in the 6.6
   # diversity 2x2. Their mechanism is still represented in the baseline table.
-  quality_score: vc_post      # vc_post | neg_s_anchor (ablation: biases to mode collapse)
+  # Which score admits an answer INTO the set. This must not be VC.
+  #
+  # `logp_mean` is the length-normalised log-likelihood of the generated answer,
+  # which is what conformal language modelling uses for admission. Phase 4 exists
+  # to test VC as a STOPPING signal against baselines at equal risk; if VC also
+  # decided which answers were retained, then every baseline -- token entropy,
+  # min token probability, even fixed_k -- would be scored on a set that VC had
+  # already filtered. There would be no VC-free arm left to compare against, and
+  # a difference in draws could not be attributed to the stopping rule.
+  #
+  #   likelihood   length-normalised likelihood p(y|x)^(1/T) = exp(mean_t log p_t),
+  #                the geometric mean per-token probability. In [0, 1] by
+  #                construction, which is why lambda_qual is a [0, 1] grid.
+  #                DEFAULT; the CLM choice.
+  #   anchor_sim   ablation: cos(anchor, a_i), i.e. retention by agreement with
+  #                the anchor, which biases toward mode collapse. Also [0, 1].
+  #   vc_post      DIAGNOSTIC ONLY. Contaminates every baseline; a pitfall check
+  #                fails fatally when it is combined with VC stopping rules.
+  quality_score: likelihood
   fwer: fixed_sequence        # fixed_sequence | bonferroni
   vacuity:
     # Lambda_hat must contain configs that actually stop early, else every method

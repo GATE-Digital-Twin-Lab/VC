@@ -51,7 +51,7 @@ model's per-sample correctness probability. The thesis is *not* "VC is uninforma
 | `delta` | float | LTT confidence: `P(R(lambda_hat) <= alpha) >= 1 - delta` |
 | `lambda` | tuple | CLM config `(lambda_qual, lambda_div, lambda_stop)` |
 | `Lambda_k` | (-inf,0] | `sum_{i<=k} log(1 - VC(q,a_i))` over *diverse retained* answers. **The product rule, accumulated in log space** |
-| `Pi_k` | [0,1] | `exp(Lambda_k)` — the same claim as a probability. Reporting/plotting only; never accumulated directly |
+| `Pi_k` | [0,1] | `exp(Lambda_k)` — the same claim as a probability. Reporting, and the units of `lambda_stop`; never *accumulated* directly |
 | `eps_vc` | float | Floor on `1 - VC` before the log. Default `1e-6` |
 | `c_discount` | float | `alpha / exp(lambda_stop_hat)` — the discount factor on VC's claims |
 
@@ -447,23 +447,100 @@ succeeded." Baselines fail identically and the compute is wasted.
 `lambda = (lambda_qual, lambda_div, lambda_stop)`.
 
 - **Retain** `a_i` if quality `>= lambda_qual` AND `min_j d(a_i, a_j) >= lambda_div` over
-  already-retained `a_j` (duplicate gating). Quality may be `vc_post`, or `-s(q, a_i)` —
-  note the latter makes retention agreement-with-anchor, which biases toward mode
-  collapse, so report it as an ablation rather than the default. Diversity gating is not
-  optional:
-  without it a mode-collapsed model fills `C(q)` with forty paraphrases of one wrong
-  answer and set size stops meaning anything.
+  already-retained `a_j` (duplicate gating). Diversity gating is not optional: without it
+  a mode-collapsed model fills `C(q)` with forty paraphrases of one wrong answer and set
+  size stops meaning anything.
 - **Stop** when the confidence statistic crosses `lambda_stop`. This is the swappable slot.
 
-| Variant | Stop when |
-|---|---|
-| `vc_product` | `Lambda_k = sum_{i<=k} log(1 - vc_post_i) <= lambda_stop` over diverse retained answers. **`lambda_stop` is in log-probability (nats) for this rule** |
-| `vc_max` | `max_{i<=k} vc_post_i >= lambda_stop` |
-| `vc_first` | `vc_1 >= lambda_stop` — budget fixed after one draw; cannot adapt |
-| `vc_prehoc` | `vc_pre >= lambda_stop` — budget fixed **before any draw**; the purest test of prospective VC |
-| `token_entropy` | `min_{i<=k} h_tok_mean_i <= lambda_stop` — family-1 baseline |
-| `min_token_p` | `max_{i<=k} min_token_p_i >= lambda_stop` |
-| **`fixed_k`** | `k >= lambda_stop` — **the null baseline** |
+**Quality is `logp_mean`, the length-normalised log-likelihood — not VC.** This is what
+conformal language modelling admits on, and here it is load-bearing rather than
+conventional. Phase 4 exists to test VC as a *stopping* signal against baselines at equal
+risk. If VC also decided which answers were retained, then `token_entropy` and even
+`fixed_k` would be scored on a set VC had already filtered: no VC-free arm would remain,
+and a difference in `E[draws]` could not be attributed to the stopping rule. VC
+appears in exactly one place, which is the claim under test. `-s(q, a_i)` is available as
+an ablation — it makes retention agreement-with-anchor, which biases toward mode collapse
+— and `vc_post` is diagnostic only, with a fatal pitfall check when it is combined with VC
+stopping rules.
+
+**Draws with a missing statistic are dropped, never imputed.** An unparsed VC is not a
+confidence of `0.0`. Filling one in puts a number the model never produced into the
+statistic the study is about, and it is not even neutral: `0.0` reads as "maximally
+unsure", so every VC rule draws more and `E[draws]` — the one quantity the headline table
+compares — is inflated in proportion to the parse-failure rate. Dropping costs the
+baselines that draw too, which is the price of every rule seeing one identical sequence.
+Report the dropped fraction: `draws` counts positions in the retained sequence, so
+`E[draws]` understates sampling actually spent by about that much.
+
+**Every component of `lambda` is searched over `[0, 1]`, except `vc_product`'s `lambda_stop`.** Each underlying score is
+rescaled to the unit interval first, so one search space serves all three dimensions and
+all seven rules, and a certified threshold is readable without a units table:
+
+| component | score | scaling |
+|---|---|---|
+| `lambda_qual` | `p(y\|x)^(1/T) = exp(mean_t log p_t)` | already `[0,1]` — a probability |
+| `lambda_div` | cosine distance | `d / 2`, since `d` spans `[0, 2]` |
+| `lambda_stop` (`vc_max`) | probability | already `[0,1]` |
+| `lambda_stop` (`vc_product`) | `Lambda_k`, a log-probability | **not rescaled** — kept in nats; `-inf` means "never stop early" |
+| `lambda_stop` (`token_entropy`) | `exp(-H)`, the geometric mean token probability | `H` is unbounded above; `exp(-H)` is in `(0,1]` and preserves the ordering |
+| `lambda_stop` (`fixed_k`) | `\|C(q)\| / N_MAX` | fraction of the budget |
+
+Divide the cosine distance by 2 rather than clipping at 1: clipping would collapse every
+anti-correlated pair, 18% of them on the corpus this was measured on.
+
+**`vc_product` stays in nats on both sides, and that exception is the point.** Its claim
+compounds, so the thresholds that matter span orders of magnitude: as probabilities they
+bunch against 0 and stop being readable, while `-5` and `-20` nats are two legible
+numbers — on the same axis 6.7 reports the product-rule gap on. Exponentiating `Lambda_k`
+to meet a `[0, 1]` threshold would also reproduce the wall of exact zeros 6.7 warns about.
+Grid it evenly in nats from `log(product_floor)` to `0` (which is geometric in the claim
+it represents), plus `-inf` for "never stop early" — the only threshold guaranteed to stay
+reachable at any `N_MAX`, and the conservative end the fixed sequence starts from.
+
+Because `lambda_stop_hat` is a log-probability, `c_discount = alpha / exp(lambda_stop_hat)`
+— exponentiate before dividing. Dividing `alpha` by a threshold in nats is a units error
+that still produces a plausible-looking number.
+
+Every remaining map is monotone increasing in `lambda_stop`, which is what lets the
+certification order (7.4) be read off the rule's direction in `lambda` space.
+
+Watch the count of *distinct* `(lambda_qual, lambda_div)` cells. `delta` is divided by the
+number of cells (7.4), so grid points that behave identically are lost power, not merely
+wasted compute. The failure to avoid is a grid placed where the scores are not: on
+`vc_post`, whose observed range is `[0.7, 1.0]`, seven of ten evenly spaced `lambda_qual`
+points were the *identical test*, and only 8 of 100 cells were genuinely distinct.
+
+**Every rule reads `C(q)`, never the raw draw stream.** The gate decides what is in the
+set; the rule then reads the set. An answer the quality or diversity gate rejected is not
+in `C(q)`, so it must not be the evidence that ends sampling — stopping because of an
+answer you then throw away would certify a set that never contained it.
+
+This is also what makes `lambda_qual` and `lambda_div` mean anything. While the statistics
+ran over all draws, gating changed the set but never the draw count: retention could not
+affect efficiency, so it was never selected at any `alpha`, and `E[|C(q)|]` was identically
+equal to `E[draws]`. Reading `C(q)` restores the trade the two dimensions exist to offer —
+a stricter gate admits less, the statistic advances more slowly, the rule spends more
+draws, and in exchange the low-quality answers that would have triggered a premature stop
+are gone.
+
+| Variant | Stop when | Family |
+|---|---|---|
+| `vc_product` | `Lambda_k = sum log(1 - vc_post_i) <= lambda_stop` over `C(q)`. **`lambda_stop` is in log-probability (nats) for this rule** | verbalised |
+| `vc_max` | the most confident answer **in `C(q)`** reaches `lambda_stop` | verbalised |
+| `token_entropy` | the lowest-entropy answer **in `C(q)`** reaches `lambda_stop`, as `exp(-H)` | token-level |
+| **`fixed_k`** | **`\|C(q)\| >= lambda_stop * N_MAX`** — **the null baseline** | none |
+
+`fixed_k` counts the *set*, not draws. Counting draws would let the null ignore the gate
+every other rule pays for, so it would be playing a different game rather than marking the
+floor.
+
+Three rules were retired. `vc_first` and `vc_prehoc` fix the budget from a single number —
+the first draw's VC, or a pre-hoc estimate — so they cannot read `C(q)` at all and belong
+to a different family from everything here; the marginal-value question they answered is
+better put to Phase 2 and 6.5, where `vc_pre` and `vc_1` are already compared against
+`vc_bar` on the same questions. `min_token_p` duplicated the token-level mechanism
+`token_entropy` already carries, and a second near-identical baseline costs multiplicity
+(7.4) without adding an argument.
 
 The sample-diversity signals are **not** stopping rules here. A diversity
 statistic over one draw is not a low value, it is not a value: one draw is one
@@ -479,13 +556,11 @@ Phase 2 AUROC comparison), which is where a statistic over a completed set of
 `fixed_k` is mandatory. If VC-based stopping cannot beat "always draw exactly k," VC
 carries no usable information about when to stop, and that is the cleanest statement of it.
 
-`vc_first` isolates whether VC knows anything about the *question* as opposed to the
-individual answers: it sees exactly one answer and must commit. If `vc_first` matches
-`vc_product`, the extra draws' VC values added nothing.
-
-`vc_prehoc` goes further — it commits with **zero** answers seen. The ladder
-`vc_prehoc -> vc_first -> vc_product` measures the marginal value of each additional
-piece of evidence VC gets to condition on. Flat across the ladder is a strong result.
+The marginal value of each extra piece of evidence VC conditions on — nothing, one
+answer, all of them — is measured in Phase 2 and 6.5 instead, where `vc_pre`, `vc_1` and
+`vc_bar` are compared against the same outcome on the same questions. That comparison does
+not require any of them to be a stopping rule, and a rule that cannot read `C(q)` has no
+place in a table whose whole point is the price of a set.
 
 ### 7.3 Risk
 `L_lambda(q) = 1[no admissible answer in C_lambda(q)]`, `R(lambda) = E_q[L_lambda(q)]`.
@@ -511,12 +586,36 @@ is no single score whose quantile solves it.
    where `h1(a,b) = a*log(a/b) + (1-a)*log((1-a)/(1-b))`.
    **The Bentkus term dominates when `R_hat` is near 0** — that is your regime at
    `alpha = 0.05`, so do not use plain Hoeffding.
-3. **FWER correction.** Bonferroni is valid but wastes power on a 1000-point grid. Prefer
-   **fixed-sequence testing along `lambda_stop`**: order from most conservative (stop
-   latest) to least, walk down, halt at the first non-rejection. No multiplicity penalty,
-   valid precisely because `R` is monotone in `lambda_stop`.
-4. **Output** `Lambda_hat = {lambda : p_lambda < delta}`. Guarantee:
-   `P(R(lambda_hat) <= alpha) >= 1 - delta` for *any* selection from `Lambda_hat`.
+3. **FWER correction.** Bonferroni over the whole grid is valid but wastes power. Use
+   **fixed-sequence testing along `lambda_stop`**, one sequence per
+   `(lambda_qual, lambda_div)` cell: order from most conservative (stops latest) to
+   least, halt at the first non-rejection. Within a sequence there is no multiplicity
+   penalty, and that is valid precisely because `R` is monotone in `lambda_stop`.
+
+   Two things this gets wrong if left implicit, neither of which raises:
+
+   - **Which end is conservative depends on the rule's comparison direction.** A `ge`
+     rule (`vc_max`, `token_entropy`, `fixed_k`) stops when its statistic *rises* to
+     `lambda_stop`, so the strictest setting is the highest and the sequence walks
+     **down**. A `le` rule (`vc_product`, `token_entropy`) stops when its statistic
+     *falls* to `lambda_stop`, so the strictest is the lowest and the sequence walks
+     **up**. Reversed, the sequence opens on its worst grid point, halts immediately and
+     returns an empty `Lambda_hat` — which reads as "this rule cannot be certified".
+     For `vc_product` that is the study's headline result arriving as a sort order.
+     Take the direction from the rule, **never from the observed risks**: a
+     data-dependent order is what fixed-sequence validity forbids.
+   - **`G` parallel sequences at `delta` each control FWER at `G * delta`.** The grid has
+     `G = 10 x 10 = 100` cells. Bonferroni **across** families, fixed sequence **within**:
+     each runs at `delta / G`. The correction falls on `delta` alone, so the `lambda_stop`
+     resolution stays free. Report `delta_family` next to `delta`.
+
+   Report the count of families whose realised `R` is not monotone along the chosen
+   order. Within a family the retention path is fixed, so a stricter threshold can only
+   stop later and stopping later can only turn a loss of 1 into a 0 — `R` is exactly
+   monotone *in the sample*, and any violation is a defect, not noise.
+4. **Output** `Lambda_hat = {lambda : p_lambda < delta / G}`. Guarantee:
+   `P(R(lambda) <= alpha for all lambda in Lambda_hat) >= 1 - delta`, which is what
+   licenses selecting from `Lambda_hat` afterwards without paying again.
 
 ### 7.5 Selection and the headline table
 Select `lambda_hat = argmin E_q[draws]` over `Lambda_hat`, **on `eval`, never on `calib`**.
@@ -527,10 +626,8 @@ For `alpha in {0.05, 0.1, 0.2}`, `delta = 0.1`:
 |---|---|---|---|---|---|---|
 | vc_product | | | | | | |
 | vc_max | | | | | | |
-| vc_first | | | | | | |
-| vc_prehoc | | | | | | |
+
 | token_entropy | | | | | | |
-| min_token_p | | | | | | |
 | fixed_k | | | | | | |
 
 **Risk is held constant by construction; efficiency is the free variable.** That is what
@@ -655,6 +752,28 @@ non-invariance are already a contribution.
 - [ ] `c_discount` computed as `alpha / lambda_stop_hat` without exponentiating the
       log-space threshold (units error; the number still looks plausible)
 - [ ] Plain Hoeffding used where `R_hat ~ 0` (Bentkus needed)
+- [ ] Fixed sequence ordered by `lambda_stop` alone, ignoring the rule's comparison
+      direction, so every `le` rule opens on its worst grid point and reports as
+      uncertifiable
+- [ ] One fixed sequence per grid cell, each run at the full `delta` (FWER is `G*delta`)
+- [ ] Sequence order derived from the observed risks rather than pre-specified
+- [ ] VC used as the retention gate as well as the stopping rule, leaving no VC-free arm
+      to compare against
+- [ ] Unparsed `vc_post` imputed as `0.0` rather than dropped — reads as "maximally
+      unsure", so every VC rule draws more and `E[draws]` is inflated
+- [ ] A `lambda` component searched on a scale that is not `[0, 1]`, so thresholds are
+      not comparable across rules and the grid cannot be read without a units table
+- [ ] Cosine distance clipped at 1 instead of divided by 2 (collapses anti-correlated pairs)
+- [ ] `Lambda_k` exponentiated to put `vc_product`'s `lambda_stop` on `[0, 1]`
+      (reproduces the underflow wall of 6.7, and makes the threshold unreadable)
+- [ ] `vc_product`'s `lambda_stop` grid spaced linearly in the CLAIM rather than evenly in
+      nats, so the thresholds that matter are never tested
+- [ ] Grid points that behave identically, each costing a family's worth of `delta`
+- [ ] A stopping rule reading the raw draw stream rather than `C(q)`, so an answer the
+      gate rejected still ends sampling -- and `lambda_qual`/`lambda_div` cost
+      multiplicity while being unable to change `E[draws]`, so they are never selected
+- [ ] `fixed_k` counting draws rather than the size of `C(q)`, so the null baseline skips
+      the gate every other rule pays for
 - [ ] No FWER correction over the `lambda` grid
 - [ ] Cosine used for clustering (negation-blind)
 - [ ] Fixed-width ECE on discrete VC values
@@ -689,12 +808,14 @@ non-invariance are already a contribution.
    This claim rests on the 6.6 diversity 2x2 and the Phase 2 AUROC comparison, where
    `f` and `H_sem` describe a completed set of `N` draws — not on the stopping table,
    which they cannot enter for the reason given in section 7. The stopping table still
-   spans two mechanisms, token-level (`h_tok`, `min_token_p`) and verbalised, so "VC
-   fails here" can be separated from "everything fails here."
+   spans two mechanisms, token-level (`token_entropy`) and verbalised (`vc_product`,
+   `vc_max`), against a null that uses neither, so "VC fails here" can be separated from
+   "everything fails here."
 6. **Pre-hoc VC ("can you answer this?") is a distinct and under-studied construct.**
-   The ladder `vc_prehoc -> vc_first -> vc_product` measures the marginal value of each
-   additional piece of evidence. If flat, post-hoc VC is not reading its own answer and
-   the whole post-hoc framing is mislabelled question-difficulty estimation.
+   The ladder `vc_pre -> vc_1 -> vc_bar` measures the marginal value of each additional
+   piece of evidence VC conditions on, in Phase 2 and 6.5 rather than as stopping rules.
+   If flat, post-hoc VC is not reading its own answer and the whole post-hoc framing is
+   mislabelled question-difficulty estimation.
 
 Do **not** claim VC is uninformative. Tian et al. found verbalised confidence from RLHF'd
 models often beats conditional token probabilities on calibration; that result will be

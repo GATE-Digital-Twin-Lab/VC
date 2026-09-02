@@ -91,6 +91,21 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
           f"retention uses {quality!r}; correctness uses {primary!r} against a_star. "
           "s is anchor-anchored and label-free; e is a_star-anchored and evaluation-only.")
 
+    # -- retention must not use the signal the stopping comparison is testing --
+    vc_rules = [s for s in cfg.get("phase4.stop_rules") if str(s).startswith("vc_")]
+    r.add("retention and stopping use different signals",
+          not (quality == "vc_post" and bool(vc_rules)), "fatal",
+          f"phase4.quality_score = {quality!r} with VC stopping rules {vc_rules}. "
+          "Phase 4 tests VC as a STOPPING signal against baselines at equal risk. "
+          "If VC also decides which answers are retained, token_entropy, "
+          "min_token_p and even fixed_k are scored on a set VC already filtered: "
+          "no VC-free arm is left and a difference in draws cannot be attributed "
+          "to the stopping rule. Admit on logp_mean, the length-normalised "
+          "log-likelihood, which is what conformal language modelling uses."
+          if quality == "vc_post" and vc_rules else
+          f"retention admits on {quality!r}; VC appears only in the stopping "
+          "rules, which is the claim under test.")
+
     # -- e must not be used as a nonconformity score --
     r.add("e_cos is not used as a nonconformity score",
           quality != "e_cos", "fatal",
@@ -208,11 +223,13 @@ def run_checks(cfg: Config, *, answers: pd.DataFrame | None = None,
           "call, overriding the backend's own defaults")
 
     # -- product rule accumulated in log space --
-    from .clm import RULE_UNITS
+    from .clm import LOG_SPACE_RULES, RULE_UNITS
     r.add("product rule is accumulated as a sum of logs",
-          RULE_UNITS.get("vc_product") == "log-probability (nats)", "fatal",
+          "vc_product" in LOG_SPACE_RULES
+          and RULE_UNITS.get("vc_product") == "log-probability (nats)", "fatal",
           "a running product underflows at large k and collapses the Phase 4 grid "
-          "quantiles into a wall of exact zeros")
+          "into a wall of exact zeros. Both the statistic and its lambda_stop stay "
+          "in nats; every other rule's lambda is on [0, 1].")
 
     eps = cfg.get("aggregation.one_minus_vc_floor", None)
     r.add("the (1 - vc) clamp is declared", eps is not None and 0 < float(eps) < 1,
