@@ -21,8 +21,10 @@ model:
   # Backend selects a transport in src/vc_uq/backends/.
   #   mock          -- synthetic generator with known p_q; used for tests + smoke runs
   #   llamacpp      -- llama-cpp-python, in-process, full-vocab logits available
-  backend: mock
-  name: mock-1b
+  backend: llamacpp
+  # `name` is part of the generation CACHE KEY (schemas.ANSWER_KEY), so changing
+  # it orphans every draw already on disk. Fix it once, at the start of a study.
+  name: gemma-3-27b-it-qat-q4_0
   mock:
     # Latent truth for the simulated world. These are the values the analysis
     # code is checked against; they are not claims about any real model.
@@ -41,8 +43,17 @@ model:
     prehoc_blind_to_fabricated: true   # vc_pre does not drop on invented entities
   llamacpp:
     # HF repo + GGUF file. Downloaded via huggingface_hub on the target machine.
-    repo_id: bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
-    filename: Meta-Llama-3.1-8B-Instruct-Q6_K.gguf
+    # Google's QAT q4_0 release: quantisation-aware trained, so it is much
+    # closer to the bf16 model than a post-hoc q4 would be -- which matters here
+    # because p_q and the token-entropy baselines are properties OF THE DECODER,
+    # and a lossy quantisation is a change to the decoder.
+    # 17.2 GB. llama.cpp's default split mode is by LAYER across every visible
+    # device, so it lands as ~9 GB + ~12 GB across the two 5090s regardless of
+    # main_gpu (which only bites in split modes NONE and ROW). That is fine
+    # here: generation and judging run as separate invocations, so the embedder
+    # and the NLI head are never resident alongside it.
+    repo_id: google/gemma-3-27b-it-qat-q4_0-gguf
+    filename: gemma-3-27b-it-q4_0.gguf
     model_path: null          # set to bypass the HF download and use a local file
     n_ctx: 4096
     n_gpu_layers: -1          # -1 = offload everything; 2x5090 has the room
@@ -80,8 +91,8 @@ model:
 
 embedding:
   # Used for e_cos (correctness criterion) and s_anchor (label-free score).
-  backend: mock               # mock | llamacpp | sentence_transformers
-  name: mock-embed
+  backend: sentence_transformers   # mock | llamacpp | sentence_transformers
+  name: Qwen3-Embedding-4B
   dim: 64
   mock:
     noise: 0.35        # instrument quality, independent of model quality
@@ -93,8 +104,13 @@ embedding:
     n_ctx: 2048
     n_gpu_layers: -1
   sentence_transformers:
-    name: sentence-transformers/all-mpnet-base-v2
-    batch_size: 32          # STEmbedder.encode; nli.hf.batch_size is separate
+    # Phase 0 is a gate ON THIS CHOICE: if e_cos cannot separate correct from
+    # incorrect at AUROC 0.85 the study stops and switches to NLI. A stronger
+    # embedder is therefore not a luxury, it is the thing being validated.
+    # 2560-dim, last-token pooled, ~8 GB in fp16.
+    name: Qwen/Qwen3-Embedding-4B
+    batch_size: 16          # STEmbedder.encode; nli.hf.batch_size is separate
+    device: cuda:1          # pinned so the two torch models share one card
   # Anisotropy correction (Phase 0 known failure mode). Applied to the whole
   # embedding matrix of a split before any cosine is taken.
   postprocess:
@@ -104,14 +120,20 @@ embedding:
 
 nli:
   # Bidirectional entailment: clustering (6.6) and correct_nli. Never cosine -- negation-blind.
-  backend: mock               # mock | hf | llm
+  backend: hf                 # mock | hf | llm
   mock:
     error_rate: 0.05
     seed: 13
   hf:
-    name: microsoft/deberta-v3-large-mnli
-    batch_size: 16
-    device: cuda
+    # `microsoft/deberta-v3-large-mnli` does not exist on the Hub -- Microsoft
+    # released deberta-v3-large without an MNLI head. This is the v1 model, and
+    # it is also the one Kuhn et al. and Farquhar et al. use for
+    # bidirectional-entailment clustering, so the 6.6 diversity numbers are
+    # comparable to the semantic-entropy literature rather than to a judge
+    # nobody else has run.
+    name: microsoft/deberta-large-mnli
+    batch_size: 32
+    device: cuda:1            # alongside the embedder, on one card
   llm:
     prompt_variant: nli_bidirectional_v1
     max_tokens: 8
@@ -147,6 +169,14 @@ dataset:
 
 generation:
   n_max: 40                   # N_MAX draws per question
+  # Flush generated draws into the append-only cache every this many draws.
+  # At 27B and ~2.4 s/draw a full pass is hours of GPU time, and a table that is
+  # only written at the end turns any kill signal, OOM or node eviction into a
+  # total loss. The cache is keyed and append-only, so a partial write is a
+  # smaller valid cache, not a corrupt one -- and `resume` picks up from it.
+  # Each flush rewrites the parquet, so this trades a few seconds of IO per
+  # checkpoint against how much work a crash can destroy. 0 disables it.
+  checkpoint_every: 200
   # Protocol 6.4 step 3. Phase 1 draws N_MAX on EVERY question (the "classify"
   # pass) and then draws a second, independent N_MAX on the questions in these
   # splits (the "downstream" pass). The first decides in_U; the second is what
@@ -208,6 +238,11 @@ phase0:
     # stale value from an old CSV would select tau_star against numbers that no
     # longer exist.
     shuffle_sheet: true       # partial labelling must not silently destratify
+    # One row per DISTINCT (question, answer), not per draw. With N_MAX draws a
+    # question the model is confident about repeats the same string many times;
+    # those rows cost human effort and cannot disagree with each other, so
+    # counting them separately inflates kappa's and AUROC's effective n.
+    unique_answers: true
     min_per_stratum: 1        # refuse if any stratum has no labelled pair
     min_coverage: 0.5         # warn below this share of the sheet labelled
 

@@ -61,6 +61,21 @@ def build_label_sheet(cfg: Config, answers: pd.DataFrame,
     if sub.empty:
         raise ValueError("no scored answers in the tau_select split")
 
+    if bool(cfg.get("phase0.labels.unique_answers")):
+        # One labelling decision per DISTINCT (question, answer). N_MAX draws of
+        # one question repeat themselves constantly -- a question the model is
+        # sure about emits the same string 8 times out of 40 -- and those rows
+        # are not independent evidence about the criterion: identical text gets
+        # identical e_cos and identical human verdict. Labelling them repeatedly
+        # spends the human budget on rows that cannot disagree, and then kappa
+        # and AUROC are computed as though they were separate observations, so
+        # the gate reports more precision than the labels contain.
+        #
+        # Deduplicated BEFORE the deciles are cut, so the strata span distinct
+        # pairs rather than distinct draws.
+        sub = (sub.sort_values(["q_id", "draw_set", "draw_idx"])
+               .drop_duplicates(subset=["q_id", "answer"], keep="first"))
+
     sub["e_bin"] = sub.groupby("dataset")["e_cos"].transform(
         lambda s: pd.qcut(s.rank(method="first"), min(n_bins, max(1, s.nunique())),
                           labels=False, duplicates="drop"))
@@ -363,14 +378,30 @@ def null_band(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
                                    "with instrument error)")
 
     if "s_anchor" in sub.columns and "anchor" in q_idx.columns:
-        anchors = q_idx["anchor"].astype(str).to_numpy()
-        s_null = cosine_distance(space.get(anchors[j % len(anchors)]), space.get(ans[i]))
-        out["s_anchor_observed_mean"] = float(sub["s_anchor"].mean())
-        out["s_anchor_null_mean"] = float(np.mean(s_null))
-        s_scores = np.concatenate([sub["s_anchor"].to_numpy(dtype=float), s_null])
-        out["s_anchor_separation_auroc"] = float(
-            1.0 - auroc(s_scores, np.concatenate([np.ones(len(sub), bool),
-                                                  np.zeros(len(s_null), bool)])))
+        # An anchor is the medoid of a question's OWN draws, so it exists only
+        # for questions that were actually generated. Staged generation
+        # (`generate --splits tau_select`) leaves the rest of the question table
+        # anchorless, and the previous indexing borrowed by position from the
+        # full table -- reaching a NaN and failing to embed it. Sample from the
+        # anchored questions instead, and re-derive the mismatch condition
+        # against THAT pool rather than reusing `j`, which indexes the other one.
+        anchored = q_idx["anchor"].dropna().astype(str)
+        if len(anchored):
+            a_ids = anchored.index.to_numpy()
+            a_txt = anchored.to_numpy()
+            ia = rng.integers(0, len(ans), size=n_pairs)
+            ja = rng.integers(0, len(a_txt), size=n_pairs)
+            keep_a = ans_q[ia] != a_ids[ja]     # a borrowed anchor, never its own
+            ia, ja = ia[keep_a], ja[keep_a]
+            s_null = cosine_distance(space.get(a_txt[ja]), space.get(ans[ia]))
+            out["s_anchor_observed_mean"] = float(sub["s_anchor"].mean())
+            out["s_anchor_null_mean"] = float(np.mean(s_null))
+            out["n_s_anchor_null_pairs"] = int(len(s_null))
+            out["n_anchored_questions"] = int(len(anchored))
+            s_scores = np.concatenate([sub["s_anchor"].to_numpy(dtype=float), s_null])
+            out["s_anchor_separation_auroc"] = float(
+                1.0 - auroc(s_scores, np.concatenate([np.ones(len(sub), bool),
+                                                      np.zeros(len(s_null), bool)])))
     return out
 
 

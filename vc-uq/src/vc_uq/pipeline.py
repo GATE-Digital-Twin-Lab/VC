@@ -197,13 +197,27 @@ def step2_gate(state: PipelineState, *, simulate_labels: bool = False,
 # Step 3 -- Phase 1 generation
 # --------------------------------------------------------------------------
 
-def step3_generate(state: PipelineState) -> PipelineState:
+def step3_generate(state: PipelineState,
+                   splits: list[str] | None = None,
+                   shard: tuple[int, int] | None = None) -> PipelineState:
     cfg, store = state.cfg, state.store
-    info = run_phase1(cfg, store, state.questions)
+    info = run_phase1(cfg, store, state.questions, splits=splits, shard=shard)
     state.answers = store.read_answers()
     state.questions = store.read_questions()
     assert_split_by_question(state.answers)
     state.results["step3_generation"] = info
+    if shard is not None:
+        state.notes.append(
+            f"Phase 1 ran shard {info['shard']} only. The other shard(s) must "
+            "complete before any phase reads the cache -- a partial shard set is "
+            "a question table with holes, not a smaller study.")
+    if splits is not None:
+        state.notes.append(
+            f"Phase 1 generated {info['n_questions_generated']} of "
+            f"{info['n_questions']} questions -- split(s) {info['splits']} only. "
+            "The cache is a strict subset of the full pass, so an unrestricted "
+            "run later reuses these draws; but no phase past the gate should be "
+            "quoted until the rest exists.")
     for table, r in info["resume"].items():
         if r["reused_from_cache"]:
             state.notes.append(

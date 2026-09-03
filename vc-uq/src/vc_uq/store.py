@@ -22,8 +22,10 @@ otherwise.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -237,6 +239,36 @@ class Store:
 
     # -- raw (append-only) -------------------------------------------------
     def append_raw(self, table: str, df: pd.DataFrame, schema, key) -> pd.DataFrame:
+        """Merge rows into the shared cache. Safe against concurrent writers.
+
+        Generation is sharded across GPUs (``generate --shard i/n``), so two
+        processes append to this one file. The merge is read-modify-write, so
+        without the lock the second writer would read a snapshot taken before
+        the first one's rows landed and then overwrite them -- silently losing
+        exactly the draws the checkpointing exists to protect. The lock is held
+        across the read AND the write, not just the write.
+        """
+        with self._raw_lock(table):
+            return self._append_raw_locked(table, df, schema, key)
+
+    def _raw_lock(self, table: str):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _lock():
+            path = self.raw_path(table).with_name(self.raw_path(table).name + ".lock")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(path, "w")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                fh.close()
+        return _lock()
+
+    def _append_raw_locked(self, table: str, df: pd.DataFrame, schema,
+                           key) -> pd.DataFrame:
         df = conform(df, schema, name=table)
         path = self.raw_path(table)
         if path.exists():
@@ -248,7 +280,18 @@ class Store:
             combined = df
         check_unique_key(combined, key, name=table)
         combined = conform(combined, schema, name=table)
-        combined.to_parquet(path, index=False)
+        # Written to a sibling and renamed. Generation checkpoints into this
+        # file every few hundred draws, so a process killed mid-write is a
+        # realistic event rather than a theoretical one -- and a half-written
+        # parquet is not a partial cache, it is an unreadable one. os.replace is
+        # atomic within a filesystem, so the old file stands until the new one
+        # is complete.
+        # Process-unique: the lock already serialises writers, but a shared
+        # ".tmp" name means any future unlocked path has two workers writing one
+        # file and renaming each other's half-written bytes into place.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        combined.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
         return combined
 
     def append_answers(self, df: pd.DataFrame) -> pd.DataFrame:

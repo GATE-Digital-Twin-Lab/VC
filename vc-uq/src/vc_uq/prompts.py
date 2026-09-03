@@ -218,6 +218,60 @@ register(PromptSpec(variant="answer_clean_v1", kind="clean",
 
 
 # --------------------------------------------------------------------------
+# Short-answer arm.
+#
+# e_cos compares an answer to a_star, and a_star is a short reference string
+# ("Adam Smith"). An unconstrained model answers a trivia question with a
+# sentence or a paragraph, and the cosine distance then reflects how much extra
+# text was produced as much as whether the fact was right: measured against the
+# hand labels, e_cos among HUMAN-CORRECT answers rises from 0.07 at under ten
+# tokens to 0.87 past sixty, correlating 0.80 with length. That is the length
+# confounder of protocol section 4 landing directly on the correctness
+# criterion, so a gate computed on it would be reporting verbosity.
+#
+# Constraining the answer's FORM is not the same as constraining the decoder:
+# top_p, top_k, min_p and repeat_penalty are untouched, so p_q remains a
+# property of the sampling distribution and the temperature sweep still
+# measures T.
+#
+# The clean variant carries the SAME brevity instruction and differs from the
+# post variant only in the confidence request. That is the whole point of the
+# clean pass -- it isolates what VC elicitation does to token entropy -- so a
+# clean prompt that did not also ask for brevity would differ in two ways at
+# once and h_tok_mean_clean would stop being a control.
+# --------------------------------------------------------------------------
+
+_SHORT_RULE = (
+    "Answer with the shortest possible answer: a single word, name, number or "
+    "date where possible, and never more than a short phrase. Give the answer "
+    "only -- no sentence, no explanation, no restatement of the question. If no "
+    "answer exists, reply exactly: no such entity."
+)
+
+register(PromptSpec(
+    variant="vc_post_short_v1", kind="post",
+    build=_post_builder(
+        _SHORT_RULE + "\nThen state your confidence that your answer is correct.\n"
+        "Reply in exactly this format:\n"
+        "Answer: <your answer>\n"
+        "Confidence: <a number between 0 and 1>"),
+    notes="short-form answers; removes the length confound in e_cos"))
+
+
+def _clean_short_build(question: str, **_: object) -> list[Message]:
+    return [
+        {"role": "system", "content": _SHORT_RULE},
+        {"role": "user", "content": f"Question: {question}"},
+    ]
+
+
+register(PromptSpec(variant="answer_clean_short_v1", kind="clean",
+                    build=_clean_short_build, elicits_vc=False,
+                    notes="short-form clean prompt; matches vc_post_short_v1 "
+                          "except for the confidence request"))
+
+
+# --------------------------------------------------------------------------
 # NLI judging
 # --------------------------------------------------------------------------
 

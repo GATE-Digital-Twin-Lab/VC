@@ -254,10 +254,43 @@ def _sheet_and_scored(cfg):
     return cfg, sheet, scored
 
 
+def _sheet_and_scored_with_duplicates(cfg):
+    """The same fixture with per-draw rows, i.e. unique_answers off.
+
+    The simulated world emits few distinct strings, so deduplicating collapses
+    its sheet to a handful of rows -- too few for the shuffling and partial
+    coverage tests below to say anything. Those tests are about sheet ORDER and
+    coverage accounting, not about deduplication, so they pin the un-deduplicated
+    path explicitly rather than depending on whichever default is current.
+    """
+    return _sheet_and_scored(cfg.with_overrides(["phase0.labels.unique_answers=false"]))
+
+
+def test_label_sheet_holds_each_question_answer_pair_once(cfg):
+    """N_MAX draws repeat themselves, and a repeat is not a second observation.
+
+    Identical text scores an identical e_cos and earns an identical human
+    verdict, so labelling it twice spends the budget on a row that cannot
+    disagree -- and then kappa and AUROC count it as independent evidence and
+    report more precision than the labels contain.
+    """
+    _, deduped, _ = _sheet_and_scored(cfg)
+    assert not deduped.duplicated(subset=["q_id", "answer"]).any()
+
+    _, per_draw, _ = _sheet_and_scored_with_duplicates(cfg)
+    assert per_draw.duplicated(subset=["q_id", "answer"]).any(), \
+        "fixture no longer produces repeats, so the dedup assertion proves nothing"
+
+    # A question may still appear more than once -- with DIFFERENT answers.
+    # Collapsing to one row per question would drop exactly the questions the
+    # model is inconsistent on, which are the informative ones.
+    assert deduped["q_id"].duplicated().any()
+
+
 def test_label_sheet_is_shuffled_not_stratum_ordered(cfg):
     """Unshuffled, the sheet is written in stratum order, so labelling the first
     half would cover only the low-e_cos bins of the first dataset."""
-    _, sheet, _ = _sheet_and_scored(cfg)
+    _, sheet, _ = _sheet_and_scored_with_duplicates(cfg)
     strata = list(sheet["stratum"])
     runs = sum(1 for a, b in zip(strata, strata[1:]) if a != b)
     # Stratum-ordered would give exactly (n_strata - 1) transitions.
@@ -302,7 +335,7 @@ def test_hand_labels_accept_common_truth_spellings(cfg, tmp_path):
 def test_unrecognised_label_counts_as_unlabelled_not_as_false(cfg, tmp_path):
     """Guessing on a value nobody wrote would fabricate ground truth."""
     from vc_uq import phase0
-    cfg2, sheet, _ = _sheet_and_scored(cfg)
+    cfg2, sheet, _ = _sheet_and_scored_with_duplicates(cfg)
     filled = sheet.copy()
     vals = [True] * len(filled)
     vals[0] = "maybe?"
@@ -316,7 +349,7 @@ def test_unrecognised_label_counts_as_unlabelled_not_as_false(cfg, tmp_path):
 
 def test_partial_labelling_is_allowed_but_reported(cfg, tmp_path):
     from vc_uq import phase0
-    cfg2, sheet, _ = _sheet_and_scored(cfg)
+    cfg2, sheet, _ = _sheet_and_scored_with_duplicates(cfg)
     filled = sheet.copy()
     # Label one pair per stratum, plus a few more: covers every stratum.
     keep = filled.groupby("stratum").head(2).index
@@ -1013,16 +1046,24 @@ class _RefusesWholeBufferConversion:
 
 
 class _FakeLlama:
-    def __init__(self, scores, prompt_len, cont_ids):
+    def __init__(self, scores, prompt_len, cont_ids, added_special=False):
         self.scores = _RefusesWholeBufferConversion(scores)
         self._prompt_len = prompt_len
         self._cont_ids = cont_ids
         self.evaluated = None
+        self.prompt_add_bos = None
+        # Reports added_special, as a real ChatFormatterResponse does. A handler
+        # that returns a bare string is refused -- see the double-BOS test.
         self.chat_handler = type("H", (), {
-            "to_chat_completion_prompt": staticmethod(lambda m: "PROMPT")})()
+            "to_chat_completion_prompt": staticmethod(
+                lambda m: ("PROMPT", added_special))})()
 
     def tokenize(self, text, add_bos=False, special=False):
-        return list(range(self._prompt_len)) if add_bos else list(self._cont_ids)
+        # Keyed on the TEXT, not on add_bos: add_bos is the thing under test.
+        if text == b"PROMPT":
+            self.prompt_add_bos = add_bos
+            return list(range(self._prompt_len))
+        return list(self._cont_ids)
 
     def reset(self):
         pass
@@ -1062,6 +1103,35 @@ def test_teacher_force_reads_only_the_rows_it_needs():
         assert stats.entropies[i] == pytest.approx(float(-(p * np.log(p)).sum()))
         assert stats.chosen_probs[i] == pytest.approx(float(p[tok]))
         assert stats.logprobs[i] == pytest.approx(float(np.log(p[tok])))
+
+
+@pytest.mark.parametrize("added_special, expect_add_bos", [(True, False),
+                                                           (False, True)])
+def test_teacher_force_prepends_a_bos_exactly_when_sampling_does(added_special,
+                                                                 expect_add_bos):
+    """The BOS must be added on the same terms as create_chat_completion.
+
+    llama-cpp-python tokenises a chat prompt with ``add_bos=not added_special``
+    (llama_chat_format.py). A template that emits its own ``<bos>`` -- gemma-3
+    and Llama-3 both do -- sets the flag, so an unconditional ``add_bos=True``
+    here prepends a SECOND BOS and teacher forcing scores the answer under a
+    prompt one token longer than the one that produced it. llama.cpp warns on
+    stderr and proceeds, so nothing fails and every h_tok_mean, logp_mean and
+    min_token_p in the study is measured against the wrong context.
+
+    That is not symmetric noise. h_tok is the token-level baseline VC is
+    compared against, so corrupting it flatters VC -- which is the hypothesis
+    under test.
+    """
+    from vc_uq.backends.llamacpp import LlamaCppLM, resolve_chat_formatter
+
+    lm = object.__new__(LlamaCppLM)
+    lm._llm = _FakeLlama(np.zeros((8, 3), dtype=np.float32), 4, [1, 2],
+                         added_special=added_special)
+    lm._format_prompt, _ = resolve_chat_formatter(lm._llm)
+    lm.teacher_force([{"role": "user", "content": "q"}], "answer")
+
+    assert lm._llm.prompt_add_bos is expect_add_bos
 
 
 def test_teacher_force_on_an_empty_continuation_is_empty_not_zero():
@@ -1108,12 +1178,29 @@ def test_formatter_prefers_the_models_own_handler():
     from vc_uq.backends.llamacpp import resolve_chat_formatter
 
     handler = type("H", (), {
-        "to_chat_completion_prompt": staticmethod(lambda m: "FROM HANDLER")})()
+        "to_chat_completion_prompt": staticmethod(
+            lambda m: ("FROM HANDLER", True))})()
     render, source = resolve_chat_formatter(
         _Llm(handler=handler, template="{{ 'FROM TEMPLATE' }}"))
 
-    assert render([{"role": "user", "content": "q"}]) == "FROM HANDLER"
+    assert render([{"role": "user", "content": "q"}]) == ("FROM HANDLER", True)
     assert source == "chat_handler.to_chat_completion_prompt"
+
+
+def test_formatter_refuses_a_handler_that_hides_whether_it_added_the_bos():
+    """A bare string is not enough to reconstruct the conditioning.
+
+    ``added_special`` decides whether a BOS is prepended. Defaulting it either
+    way is a coin flip on whether every token statistic is aligned with the
+    text that produced it, and being wrong costs nothing visible at runtime.
+    """
+    from vc_uq.backends.llamacpp import resolve_chat_formatter
+
+    handler = type("H", (), {
+        "to_chat_completion_prompt": staticmethod(lambda m: "BARE STRING")})()
+    render, _ = resolve_chat_formatter(_Llm(handler=handler))
+    with pytest.raises(RuntimeError, match="bare string"):
+        render([{"role": "user", "content": "q"}])
 
 
 def test_formatter_falls_back_to_the_gguf_own_template(monkeypatch):
@@ -1128,12 +1215,12 @@ def test_formatter_falls_back_to_the_gguf_own_template(monkeypatch):
 
     def fake_jinja(template, *, bos_token, eos_token):
         seen.update(template=template, bos=bos_token, eos=eos_token)
-        return lambda msgs: f"RENDERED[{template}]"
+        return lambda msgs: (f"RENDERED[{template}]", True)
 
     monkeypatch.setattr(llamacpp, "_jinja_formatter", fake_jinja)
     render, source = llamacpp.resolve_chat_formatter(_Llm(template="QWEN-TEMPLATE"))
 
-    assert render([]) == "RENDERED[QWEN-TEMPLATE]"
+    assert render([]) == ("RENDERED[QWEN-TEMPLATE]", True)
     assert source == "gguf tokenizer.chat_template"
     assert seen == {"template": "QWEN-TEMPLATE", "bos": "<bos>", "eos": "<eos>"}
 
@@ -1155,9 +1242,9 @@ def test_configured_chat_format_is_used_when_the_gguf_has_no_template(monkeypatc
     from vc_uq.backends import llamacpp
 
     monkeypatch.setattr(llamacpp, "_named_formatter",
-                        lambda name: (lambda msgs: f"NAMED[{name}]"))
+                        lambda name: (lambda msgs: (f"NAMED[{name}]", False)))
     render, source = llamacpp.resolve_chat_formatter(_Llm(), chat_format="chatml")
-    assert render([]) == "NAMED[chatml]"
+    assert render([]) == ("NAMED[chatml]", False)
     assert source == "chat_format='chatml'"
 
 
@@ -1678,6 +1765,171 @@ def test_phase1_runs_both_passes_over_the_right_questions(cfg):
     assert set(dwn["q_id"]) == set(qs.loc[qs["split"].isin(["calib", "eval"]), "q_id"])
     assert info["n_downstream_draws"] > 0
     assert set(dwn["split"]) <= {"calib", "eval"}
+
+
+def test_staged_generation_is_a_strict_subset_of_the_full_pass(cfg):
+    """`generate --splits tau_select` must not cost the full run anything.
+
+    The Phase 0 gate needs only tau_select, and a failed gate ends the study, so
+    staging it first is the difference between spending an afternoon and
+    spending a week to find out the criterion is blunt. That is only true if the
+    staged draws are IDENTICAL to the ones the full pass would have made -- the
+    seed is a hash of (draw_set, q_id, draw_idx, T, variant) and `split` is
+    deliberately not in the cache key, so they are. Checked, because the failure
+    is silent: a differing seed would just regenerate, and the run would look
+    fine while having thrown the staged pass away.
+    """
+    from vc_uq.datasets import build_questions
+    from vc_uq.generate import run_phase1
+    from vc_uq.store import Store
+
+    c = _two_pass_cfg(cfg)
+    qs = build_questions(c)
+
+    store = Store(c)
+    staged = run_phase1(c, store, qs, splits=["tau_select"])
+    partial = store.read_answers()
+    tau_ids = set(qs.loc[qs["split"] == "tau_select", "q_id"])
+
+    assert set(partial["q_id"]) == tau_ids
+    assert staged["n_questions_generated"] == len(tau_ids)
+    assert staged["n_questions"] == len(qs), \
+        "the question table is written whole; a staged pass must not delete rows"
+    # vc_pre is elicited only where it was asked for, and left null elsewhere
+    # rather than imputed.
+    written = store.read_questions()
+    assert written.loc[written["split"] == "tau_select", "vc_pre"].notna().all()
+    assert written.loc[written["split"] != "tau_select", "vc_pre"].isna().all()
+
+    full = run_phase1(c, store, qs)
+    assert full["resume"]["answers[classify]"]["reused_from_cache"] >= len(partial), \
+        "the full pass must reuse every staged draw, not resample it"
+
+    after = store.read_answers()
+    key = ["q_id", "draw_set", "draw_idx"]
+    rejoined = partial.merge(after, on=key, suffixes=("_staged", "_full"))
+    assert len(rejoined) == len(partial)
+    assert (rejoined["answer_staged"] == rejoined["answer_full"]).all()
+    assert (rejoined["seed_staged"] == rejoined["seed_full"]).all()
+
+
+def test_generation_checkpoints_so_a_crash_keeps_completed_draws(cfg):
+    """A kill signal at hour three must not cost hours one and two.
+
+    The failure this replaces was total: draws accumulated in memory and the
+    parquet was written once, at the end, so anything short of a clean exit left
+    data/raw/ empty. At 27B and ~2.4 s/draw that is the difference between
+    losing minutes and losing an afternoon.
+    """
+    from vc_uq.datasets import build_questions
+    from vc_uq.generate import Generator
+    from vc_uq.store import Store
+
+    c = cfg.with_overrides(["generation.checkpoint_every=5"])
+    store = Store(c)
+    qs = build_questions(c).head(4)
+
+    gen = Generator(c, store)
+    boom = RuntimeError("node evicted")
+    n_calls = {"n": 0}
+    real_call = gen._call
+
+    def die_after_12(*a, **k):
+        n_calls["n"] += 1
+        if n_calls["n"] > 12:
+            raise boom
+        return real_call(*a, **k)
+
+    gen._call = die_after_12
+    with pytest.raises(RuntimeError, match="node evicted"):
+        gen.draw_answers(qs, n_max=8, resume=True, store_per_position=False)
+
+    survived = store.read_answers()
+    assert len(survived) >= 10, \
+        f"only {len(survived)} draws survived the crash; checkpointing did nothing"
+
+    # And the resumed run regenerates only what is genuinely missing.
+    gen2 = Generator(c, store)
+    out = gen2.draw_answers(qs, n_max=8, resume=True, store_per_position=False)
+    assert len(out) == 4 * 8
+    assert gen2.last_resume["reused_from_cache"] == len(survived)
+    assert gen2.last_resume["generated"] == 4 * 8 - len(survived)
+
+
+def test_shards_are_disjoint_exhaustive_and_order_independent():
+    from vc_uq.generate import shard_questions
+
+    qs = pd.DataFrame({"q_id": [f"q{i:03d}" for i in range(37)]})
+    shards = [shard_questions(qs, (i, 3)) for i in range(3)]
+    ids = [set(sh["q_id"]) for sh in shards]
+
+    assert set().union(*ids) == set(qs["q_id"])
+    assert sum(len(i) for i in ids) == len(qs), "shards overlap"
+    # Two workers may build the frame in different orders; they must still agree
+    # on who owns what, or a question is generated twice and another never.
+    shuffled = qs.sample(frac=1.0, random_state=0)
+    for i in range(3):
+        assert set(shard_questions(shuffled, (i, 3))["q_id"]) == ids[i]
+
+    assert list(shard_questions(qs, None)["q_id"]) == list(qs["q_id"])
+    with pytest.raises(ValueError, match="shard must be"):
+        shard_questions(qs, (3, 3))
+
+
+def test_concurrent_shards_do_not_lose_each_others_draws(cfg):
+    """Two workers append to one cache; the lock is what keeps both.
+
+    append_raw is read-modify-write, so an unlocked second writer would read a
+    snapshot from before the first one's rows landed and overwrite them. This
+    drives the two shards from separate PROCESSES, because the lock is an flock
+    and a single-process test would not exercise it.
+    """
+    import subprocess
+    import sys as _sys
+    from vc_uq.datasets import build_questions
+    from vc_uq.store import Store
+
+    c = cfg.with_overrides(["generation.checkpoint_every=3"])
+    store = Store(c)
+    qs = build_questions(c)
+    n_q = len(qs)
+
+    script = (
+        "import sys;"
+        "from vc_uq.config import load_config;"
+        "from vc_uq.datasets import build_questions;"
+        "from vc_uq.generate import run_phase1;"
+        "from vc_uq.store import Store;"
+        "c = load_config(overrides=["
+        f"'run.data_root={c.data['run']['data_root']}',"
+        f"'run.results_root={c.data['run']['results_root']}',"
+        "'run.name=test','model.backend=mock','embedding.backend=mock',"
+        "'nli.backend=mock','generation.n_max=4','generation.r_pre=2',"
+        "'generation.checkpoint_every=3',"
+        "'dataset.triviaqa.n_questions=30','dataset.fabricated.n_questions=10']);"
+        "s = Store(c, run_id='shardtest');"
+        "run_phase1(c, s, build_questions(c), shard=(int(sys.argv[1]), 2))"
+    )
+    procs = [subprocess.Popen([_sys.executable, "-c", script, str(i)])
+             for i in range(2)]
+    for pr in procs:
+        assert pr.wait() == 0, "a shard worker failed"
+
+    answers = store.read_answers()
+    cls = answers[answers["draw_set"] == "classify"]
+    assert set(cls["q_id"]) == set(qs["q_id"]), \
+        "a shard's draws were overwritten by the other shard's write"
+    assert len(cls) == n_q * 4
+
+
+def test_staged_generation_refuses_a_split_that_holds_nothing(cfg):
+    from vc_uq.datasets import build_questions
+    from vc_uq.generate import run_phase1
+    from vc_uq.store import Store
+
+    c = _two_pass_cfg(cfg)
+    with pytest.raises(ValueError, match="no questions in split"):
+        run_phase1(c, Store(c), build_questions(c), splits=["nonesuch"])
 
 
 def test_step4_reads_the_classification_pass_and_6_7_reads_the_downstream_pass(cfg):

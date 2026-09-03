@@ -57,6 +57,18 @@ class LlamaCppConfig:
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
+def _rendered(response) -> tuple[str, bool]:
+    """``(prompt, added_special)`` off a ``ChatFormatterResponse``.
+
+    ``added_special`` decides whether a BOS is prepended when the prompt is
+    tokenised, and llama-cpp-python reads it off exactly this attribute:
+    ``create_chat_completion`` tokenises with ``add_bos=not added_special``.
+    Teacher forcing has to make the same choice or it conditions on a different
+    sequence -- see :meth:`LlamaCppLM.teacher_force`.
+    """
+    return response.prompt, bool(getattr(response, "added_special", False))
+
+
 def _jinja_formatter(template: str, *, bos_token: str, eos_token: str):
     """The model's own Jinja chat template, wrapped by llama-cpp-python.
 
@@ -67,7 +79,7 @@ def _jinja_formatter(template: str, *, bos_token: str, eos_token: str):
 
     formatter = Jinja2ChatFormatter(template=template, bos_token=bos_token,
                                     eos_token=eos_token)
-    return lambda msgs: formatter(messages=list(msgs)).prompt
+    return lambda msgs: _rendered(formatter(messages=list(msgs)))
 
 
 def _named_formatter(name: str):
@@ -79,7 +91,7 @@ def _named_formatter(name: str):
     for candidate in (f"format_{flat}", f"format_{snake}"):
         fn = getattr(llama_chat_format, candidate, None)
         if fn is not None:
-            return lambda msgs: fn(messages=list(msgs)).prompt
+            return lambda msgs: _rendered(fn(messages=list(msgs)))
     return None
 
 
@@ -92,7 +104,7 @@ def _special_token(llm, which: str) -> str:
 
 
 def resolve_chat_formatter(llm, *, chat_format: str | None = None):
-    """Return ``(render(messages) -> str, source)``, or raise.
+    """Return ``(render(messages) -> (str, added_special), source)``, or raise.
 
     The refusal at the end is the point. An earlier version fell back to
     ``format_llama3`` and then to hand-concatenated "role: content" text,
@@ -106,7 +118,24 @@ def resolve_chat_formatter(llm, *, chat_format: str | None = None):
     handler = getattr(llm, "chat_handler", None) or getattr(llm, "_chat_handler", None)
     fmt = getattr(handler, "to_chat_completion_prompt", None)
     if fmt is not None:
-        return (lambda msgs: fmt(list(msgs))), "chat_handler.to_chat_completion_prompt"
+        # A bare string tells us the text but not whether the formatter already
+        # emitted the special prefix, and that flag decides whether a BOS is
+        # prepended. Guessing it is the same class of error as guessing the
+        # template: the run completes and every token statistic is measured one
+        # token out of alignment. Only accept it if it reports the flag.
+        def _render(msgs):
+            out = fmt(list(msgs))
+            if isinstance(out, tuple) and len(out) == 2:
+                return str(out[0]), bool(out[1])
+            if hasattr(out, "prompt"):
+                return _rendered(out)
+            raise RuntimeError(
+                "chat_handler.to_chat_completion_prompt returned a bare string, so "
+                "whether it already emitted the special-token prefix is unknown. "
+                "teacher_force cannot decide whether to prepend a BOS, and being "
+                "one token out shifts every h_tok, logp_mean and min_token_p onto "
+                "the wrong context. Set model.llamacpp.chat_format explicitly.")
+        return _render, "chat_handler.to_chat_completion_prompt"
 
     template = (getattr(llm, "metadata", None) or {}).get("tokenizer.chat_template")
     if template:
@@ -168,7 +197,7 @@ class LlamaCppLM:
             self._llm, chat_format=cfg.chat_format)
 
     # -- prompt handling ---------------------------------------------------
-    def _render(self, messages: Sequence[dict]) -> str:
+    def _render(self, messages: Sequence[dict]) -> tuple[str, bool]:
         """Apply the loaded model's own chat template.
 
         ``create_chat_completion`` formats the messages internally and
@@ -177,8 +206,30 @@ class LlamaCppLM:
         min_token_p would describe a context the answer was never produced in.
         The formatter is resolved once at construction by
         :func:`resolve_chat_formatter`, which refuses to guess.
+
+        Returns the rendered text and ``added_special`` -- see
+        :meth:`_prompt_tokens` for why the second value is not cosmetic.
         """
         return self._format_prompt(list(messages))
+
+    def _prompt_tokens(self, messages: Sequence[dict]) -> list[int]:
+        """The token sequence ``create_chat_completion`` would condition on.
+
+        The BOS is the trap. A chat template that emits its own ``<bos>`` sets
+        ``added_special``, and llama-cpp-python then tokenises the rendered
+        prompt with ``add_bos=False`` (llama_chat_format.py: ``add_bos=not
+        result.added_special``). Tokenising with ``add_bos=True`` here instead
+        would prepend a SECOND BOS, so teacher forcing would score the answer
+        under a prompt one token longer than the one that produced it -- and
+        llama.cpp says so on stderr and carries on regardless.
+
+        Nothing would crash. ``h_tok_mean`` is the token-level baseline VC is
+        being compared against, so a quietly misaligned context does not add
+        noise symmetrically: it degrades the baseline and flatters VC, which is
+        the study's own hypothesis.
+        """
+        prompt, added_special = self._render(messages)
+        return self._tokenize(prompt, add_bos=not added_special)
 
     def _tokenize(self, text: str, *, add_bos: bool) -> list[int]:
         return self._llm.tokenize(text.encode("utf-8"), add_bos=add_bos, special=True)
@@ -212,8 +263,7 @@ class LlamaCppLM:
         return Generation(text=text, stats=stats, finish_reason=finish)
 
     def teacher_force(self, messages: Sequence[dict], continuation: str) -> TokenStats:
-        prompt = self._render(messages)
-        prompt_ids = self._tokenize(prompt, add_bos=True)
+        prompt_ids = self._prompt_tokens(messages)
         cont_ids = self._tokenize(continuation, add_bos=False)
         if not cont_ids:
             empty = np.zeros(0)

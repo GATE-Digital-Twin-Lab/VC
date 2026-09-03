@@ -216,8 +216,25 @@ class Generator:
             todo = keys
         pending = set(zip(todo["q_id"].astype(str), todo["draw_idx"].astype(int)))
 
+        # Checkpointing, but ONLY on the persisted path. resume=False is the
+        # Phase 5 sweep, which generates at other temperatures and prompt
+        # variants into frames that are deliberately never cached -- flushing
+        # those would put sweep draws into the table Phases 2-4 read.
+        checkpoint_every = int(self.cfg.get("generation.checkpoint_every"))
         rows: list[dict] = []
         per_position: list[dict] = []
+        n_flushed = 0
+
+        def _flush() -> None:
+            nonlocal rows, per_position, n_flushed
+            if rows:
+                self.store.append_answers(pd.DataFrame(rows))
+                n_flushed += len(rows)
+                rows = []
+            if per_position:
+                self.store.append_per_position(pd.DataFrame(per_position))
+                per_position = []
+
         for _, q in questions.iterrows():
             keep_positions = store_per_position and self._keep_per_position(
                 str(q["q_id"]), keep_frac)
@@ -255,17 +272,35 @@ class Generator:
                         "chosen_probs": gen.stats.chosen_probs.tolist(),
                     })
                 rows.append(row)
+                if resume and checkpoint_every and len(rows) >= checkpoint_every:
+                    # A 27B model at ~2.4 s/draw is hours of GPU time. Losing it
+                    # to a kill signal or an OOM because nothing was written
+                    # until the end is not an acceptable failure mode, and the
+                    # cache is append-only and keyed, so a partial write is a
+                    # valid smaller cache rather than a corrupt one.
+                    _flush()
 
-        new = pd.DataFrame(rows) if rows else empty_frame(ANSWERS_SCHEMA)
-        if cached is not None and len(cached):
-            out = pd.concat([self._refresh_split(cached, questions), new],
-                            ignore_index=True)
+        if resume:
+            _flush()
+            # Re-read rather than concatenating in memory: the flushed rows are
+            # already in the cache, and this way the return value is the cache's
+            # own view of exactly the keys that were asked for -- including rows
+            # a CONCURRENT shard wrote (see Store.append_raw).
+            out = self._refresh_split(self.store.cached_answers(keys), questions)
             out = out.sort_values(["q_id", "draw_idx"]).reset_index(drop=True)
+            n_new = n_flushed
         else:
-            out = new
+            n_new = len(rows)
+            new_df = pd.DataFrame(rows) if rows else empty_frame(ANSWERS_SCHEMA)
+            if cached is not None and len(cached):
+                out = pd.concat([self._refresh_split(cached, questions), new_df],
+                                ignore_index=True)
+                out = out.sort_values(["q_id", "draw_idx"]).reset_index(drop=True)
+            else:
+                out = new_df
 
-        self.last_resume = {"requested": int(len(keys)), "generated": int(len(new)),
-                            "reused_from_cache": int(len(out)) - int(len(new))}
+        self.last_resume = {"requested": int(len(keys)), "generated": int(n_new),
+                            "reused_from_cache": int(len(out)) - int(n_new)}
         audit = parse_audit_from_status(out["parse_status"])
         audit["prompt_variant"] = variant
         audit["temperature"] = temperature
@@ -280,7 +315,9 @@ class Generator:
             # Append-only into the shared raw cache, not the run directory: these
             # arrays cost a decode to recreate, and a resumed run only produces
             # them for the draws it actually made. Appending lets the earlier
-            # run's rows stand instead of vanishing.
+            # run's rows stand instead of vanishing. (On the resume path _flush
+            # has already emptied this; only the unpersisted Phase 5 path can
+            # still reach here with rows, and it has no store to write to.)
             self.store.append_per_position(pd.DataFrame(per_position))
         return out
 
@@ -338,7 +375,31 @@ class Generator:
         return out
 
 
-def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame) -> dict:
+def shard_questions(questions: pd.DataFrame, shard: tuple[int, int] | None
+                    ) -> pd.DataFrame:
+    """The ``i`` of ``n`` slice of the question table, for parallel generation.
+
+    One 27B instance per GPU is roughly twice the throughput of one instance
+    layer-split across both, since llama.cpp's default split runs the two halves
+    in sequence with a transfer between them. Each worker pins itself to one
+    device with ``CUDA_VISIBLE_DEVICES`` and takes one shard.
+
+    Sliced by POSITION over a q_id-sorted table, so the shards are disjoint,
+    exhaustive and identical whatever order the caller built the frame in. They
+    write to the same cache, which is safe because Store.append_raw holds a lock
+    across its read-modify-write.
+    """
+    if shard is None:
+        return questions
+    i, n = shard
+    if not (0 <= i < n) or n < 1:
+        raise ValueError(f"shard must be i/n with 0 <= i < n, got {i}/{n}")
+    return questions.sort_values("q_id").iloc[i::n]
+
+
+def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame,
+               *, splits: list[str] | None = None,
+               shard: tuple[int, int] | None = None) -> dict:
     """Generate and cache everything Phase 1 owes downstream phases.
 
     Two passes of N_MAX (protocol 6.4):
@@ -358,14 +419,36 @@ def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame) -> dict:
     Resumable: re-running against a populated cache generates nothing and costs
     a parquet read, so a job that dies at hour nine of twelve restarts where it
     stopped rather than from zero.
+
+    ``splits`` restricts generation to those splits, for staging a long job.
+    The Phase 0 gate needs only ``tau_select``, and a gate that fails ends the
+    study -- so drawing the other 90% of the questions first is spending most of
+    the compute before finding out whether any of it is interpretable. Because
+    ``split`` is deliberately NOT part of the cache key and the per-draw seed is
+    a hash of ``(draw_set, q_id, draw_idx, T, variant)``, a staged pass is a
+    strict subset of the full one: the later unrestricted run reuses every draw
+    made here rather than resampling it.
+
+    The question table is still written whole. Only ``vc_pre`` is left null for
+    questions this pass did not elicit -- writing the subset would delete the
+    other questions from the shared table.
     """
     gen = Generator(cfg, store)
 
-    classify = gen.draw_answers(questions, draw_set="classify", resume=True)
+    target = questions
+    if splits is not None:
+        target = questions[questions["split"].isin([str(s) for s in splits])]
+        if target.empty:
+            raise ValueError(
+                f"no questions in split(s) {sorted(splits)}; the table holds "
+                f"{sorted(questions['split'].unique())}")
+    target = shard_questions(target, shard)
+
+    classify = gen.draw_answers(target, draw_set="classify", resume=True)
     resume_answers = {"classify": dict(gen.last_resume)}
 
     downstream_splits = [str(s) for s in cfg.get("generation.downstream_splits")]
-    downstream_q = questions[questions["split"].isin(downstream_splits)]
+    downstream_q = target[target["split"].isin(downstream_splits)]
     if len(downstream_q):
         downstream = gen.draw_answers(downstream_q, draw_set="downstream",
                                       resume=True)
@@ -378,15 +461,21 @@ def run_phase1(cfg: Config, store: Store, questions: pd.DataFrame) -> dict:
     answers = store.append_answers(
         pd.concat([classify, downstream], ignore_index=True))
 
-    pre = gen.draw_vc_pre(questions, resume=True)
+    pre = gen.draw_vc_pre(target, resume=True)
     resume_pre = dict(gen.last_resume)
     pre = store.append_vc_pre_repeats(pre)
 
+    # The FULL question table, never `target`: attach_vc_pre left-joins, so a
+    # staged pass leaves vc_pre null on the questions it skipped instead of
+    # dropping them from the shared table.
     questions = attach_vc_pre(questions, pre)
     store.write_questions(questions, raw=True)
 
     return {
+        "splits": None if splits is None else sorted(str(s) for s in splits),
+        "shard": None if shard is None else f"{shard[0]}/{shard[1]}",
         "n_questions": int(len(questions)),
+        "n_questions_generated": int(len(target)),
         "n_answers": int(len(answers)),
         "n_classify_draws": int(len(classify)),
         "n_downstream_draws": int(len(downstream)),

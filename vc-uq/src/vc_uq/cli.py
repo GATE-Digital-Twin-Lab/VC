@@ -3,6 +3,8 @@
   python -m vc_uq step1        temperature sweep only (the cheapest signal)
   python -m vc_uq gate         Phase 0 instrument validation
   python -m vc_uq generate     Phase 1 sampling into the append-only cache
+                               (--splits tau_select to stage the gate first;
+                                --shard i/n to run one worker per GPU)
   python -m vc_uq survival     Phase 3
   python -m vc_uq descriptive  Phase 2
   python -m vc_uq clm          Phase 4
@@ -88,6 +90,17 @@ def main(argv: list[str] | None = None) -> int:
                          "and correct_human are read")
     ap.add_argument("--simulate-labels", action="store_true",
                     help="use known truth instead of hand labels; simulated backend only")
+    ap.add_argument("--shard", default=None, metavar="I/N",
+                    help="generate only shard I of N (Phase 1 only). One 27B "
+                         "instance per GPU beats one split across both, so run "
+                         "CUDA_VISIBLE_DEVICES=0 ... --shard 0/2 and "
+                         "CUDA_VISIBLE_DEVICES=1 ... --shard 1/2 concurrently. "
+                         "Shards share the cache; writes are lock-protected.")
+    ap.add_argument("--splits", default=None,
+                    help="comma-separated splits to generate (Phase 1 only), e.g. "
+                         "tau_select. Stages a long job: the Phase 0 gate needs "
+                         "only tau_select, and the draws are a strict subset of "
+                         "the full pass, so a later unrestricted run reuses them.")
     ap.add_argument("--run-id", default=None,
                     help="write into this existing run directory instead of the latest")
     ap.add_argument("--new-run", action="store_true",
@@ -142,7 +155,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "generate":
-        state = pipeline.step3_generate(state)
+        splits = ([s.strip() for s in args.splits.split(",") if s.strip()]
+                  if args.splits else None)
+        shard = None
+        if args.shard:
+            try:
+                i, n = (int(x) for x in args.shard.split("/", 1))
+            except ValueError:
+                print(f"--shard must look like 0/2, got {args.shard!r}",
+                      file=sys.stderr)
+                return 2
+            shard = (i, n)
+        state = pipeline.step3_generate(state, splits=splits, shard=shard)
     elif args.command == "step1":
         state = pipeline.step1_temperature(state)
     elif args.command == "gate":

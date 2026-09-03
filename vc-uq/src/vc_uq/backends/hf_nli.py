@@ -15,7 +15,7 @@ import numpy as np
 
 
 class HFNLI:
-    def __init__(self, name: str = "microsoft/deberta-v3-large-mnli",
+    def __init__(self, name: str = "microsoft/deberta-large-mnli",
                  batch_size: int = 16, device: str = "cuda"):
         try:
             import torch
@@ -62,14 +62,18 @@ class STEmbedder:
     """sentence-transformers embeddings, as an alternative to the GGUF path."""
 
     def __init__(self, name: str = "sentence-transformers/all-mpnet-base-v2",
-                 batch_size: int = 32):
+                 batch_size: int = 32, device: str | None = None):
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:  # pragma: no cover
             raise ImportError("sentence-transformers is not installed") from exc
         self.name = name
         self.batch_size = batch_size
-        self._model = SentenceTransformer(name)
+        # Explicit device, because the default lands on cuda:0 -- which on this
+        # rig is the card holding the generator's GGUF. Two large models on one
+        # card is an OOM in the middle of a run, not a slowdown.
+        self.device = device
+        self._model = SentenceTransformer(name, device=device)
         self.dim = int(self._model.get_sentence_embedding_dimension())
 
     def embed(self, texts: Sequence[str]) -> np.ndarray:

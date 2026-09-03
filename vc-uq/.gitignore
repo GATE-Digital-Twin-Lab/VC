@@ -1,0 +1,17 @@
+# Generation cache and derived output. data/raw/ is the expensive artifact --
+# it is deliberately kept out of git (GGUF-scale parquet), so back it up
+# separately rather than relying on the repo.
+data/
+results/runs/
+results/figures/*
+results/tables/*
+!results/figures/.gitkeep
+!results/tables/.gitkeep
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+non-commit/
