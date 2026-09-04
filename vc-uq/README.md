@@ -47,13 +47,43 @@ Every invocation writes derived output into a timestamped run directory:
 results/runs/20260827-094939__smoke/
     manifest.json          what ran, when, on which model, at which git rev
     config.snapshot.yaml   the fully resolved config, overrides included
-    tables/                *.csv, *.json
-    figures/               *.png
-    processed/             *.parquet
+    processed/             *.parquet -- the handoff BETWEEN phases
+    run/                   splits, pitfalls, notes -- not owned by one phase
+    phase0_gate/           gate.json, tau_sweep.csv, label_*.csv
+    phase1_generation/     parse audits
+    phase2_descriptive/    reliability, AUROCs, VC histograms
+    phase3_survival/       KM, hazard, budget, U detection, product rule
+    phase4_clm/            LTT headline, discount stability
+    phase5_invariance/     temperature and paraphrase sweeps
+    phase6_transfer/       isotonic transfer
 data/raw/                  SHARED generation cache, keyed by run.name
     smoke__answers.parquet
     smoke__vc_pre_repeats.parquet
     smoke__per_position.parquet
+```
+
+**One directory per phase**, each holding that phase's tables *and* its figures.
+A single flat `tables/` reached 28 files on a full run and stopped being
+readable, and `km.csv` and `km.png` are one result in two renderings -- splitting
+them across `tables/` and `figures/` meant every question about a figure started
+by guessing which tree it was in. Names lose the `phaseN_` prefix, since the
+directory now carries it: `tables/phase3_km.csv` is `phase3_survival/km.csv`.
+
+Directories are numbered by **protocol section**, not execution order -- the
+pipeline runs generation before the gate, and a second numbering on disk would
+be one too many. They are created on first write, so a run that stopped after
+the gate does not grow seven empty folders implying work that never happened.
+
+`processed/` is deliberately *not* under a phase: it is the handoff between them
+(Phase 0 writes correctness onto it, Phase 3 adds clusters, Phase 4 reads it),
+so filing it under whichever phase touched it last would misdescribe it.
+
+A run written before this layout is converted in place, idempotently:
+
+```python
+from pathlib import Path
+from vc_uq.store import migrate_layout
+migrate_layout(Path("results/runs/20260827-094939__smoke"))   # dry_run=True to preview
 ```
 
 The raw cache is deliberately **not** timestamped. It is the expensive artifact,
@@ -157,7 +187,7 @@ effect being measured.
 ## Phase 0 is a gate, and it needs hand labels
 
 `vc_uq gate` writes a stratified sheet of ~300 `(a_i, a_star)` pairs to
-`<run dir>/tables/phase0_label_sheet.csv` and exits. Fill `correct_human` and
+`<run dir>/phase0_gate/label_sheet.csv` and exits. Fill `correct_human` and
 re-run with `--labels <path>`. Stratification is across datasets *and* across
 the `e_cos` range: a random sample is almost all easy and says nothing about the
 boundary where `tau` sits.
@@ -178,7 +208,7 @@ Three things the loader does deliberately:
 - **Partial labelling is fine; an empty stratum is not.** Unlabelled rows are
   dropped and coverage is reported per stratum. A stratum with no labelled pair
   exits **3** and writes the per-stratum table to
-  `tables/phase0_label_coverage.json` so you can see what still needs doing.
+  `phase0_gate/label_coverage.json` so you can see what still needs doing.
   Overall coverage would hide exactly that hole.
 
 `TRUE/FALSE`, `yes/no`, `1/0` and `y/n` are all accepted. A value that isn't
@@ -238,7 +268,7 @@ other, and then adding one question could move a *different* one across the
 calib/eval boundary — a far worse failure.
 
 So the imbalance is accepted and **reported**: every run writes
-`tables/dataset_split_deviation.csv`, and a pitfall check fails when any stratum
+`run/dataset_split_deviation.csv`, and a pitfall check fails when any stratum
 misses its target share by more than `dataset.splits.max_share_deviation`. This
 matters most for the fabricated set, which is small and carries the `p_q = 0`
 population that the U-cell analysis rests on.
@@ -270,7 +300,7 @@ population that the U-cell analysis rests on.
 ## Pitfalls as code
 
 `pitfalls.py` turns §11 into 24 executable checks over the actual artifacts,
-written to `results/tables/*__pitfalls.csv`. `fatal` invalidates a result;
+written to `<run dir>/run/pitfalls.csv`. `fatal` invalidates a result;
 `warn` needs a sentence in the writeup. `tests/test_guards.py` constructs the
 situation each check exists to catch and asserts it fires — and asserts the
 default config passes, so the checks are not unconditionally pessimistic.

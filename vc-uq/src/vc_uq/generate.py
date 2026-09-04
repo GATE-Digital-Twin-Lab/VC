@@ -31,6 +31,7 @@ disk, instead of generating it and discarding it at write time.
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -52,6 +53,46 @@ def derive_seed(run_seed: int, *parts: object) -> int:
     key = "::".join([str(run_seed), *[str(p) for p in parts]])
     h = hashlib.blake2b(key.encode("utf-8"), digest_size=8)
     return int.from_bytes(h.digest(), "big") % _SEED_MODULUS
+
+
+class _NullBar:
+    """Stand-in when progress is off, tqdm is absent, or there is nothing to do."""
+
+    def update(self, n: int = 1) -> None:
+        pass
+
+    def set_postfix_str(self, s: str) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _progress(total: int, desc: str, cfg: Config):
+    """A bar over the draws this call will ACTUALLY generate.
+
+    Sized by the pending set rather than by the requested keys. On a resumed run
+    most keys are already cached, and a bar that counted cache hits would jump
+    to 95% in the first second and then crawl for eight hours -- worse than no
+    bar, because it reads as a stall.
+
+    Written to stderr so the JSON summary on stdout stays machine-readable, and
+    throttled hard when stderr is redirected: at 84k draws an unthrottled bar
+    writes 84k lines into the log file.
+    """
+    mode = str(cfg.get("generation.progress"))
+    if mode == "never" or total <= 0:
+        return _NullBar()
+    is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    if mode == "auto" and not is_tty:
+        return _NullBar()
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:      # pragma: no cover - optional dependency
+        return _NullBar()
+    return tqdm(total=total, desc=desc, unit="draw", file=sys.stderr,
+                dynamic_ncols=True, smoothing=0.05,
+                mininterval=0.1 if is_tty else 30.0)
 
 
 def _mock_meta(messages: list[dict], meta: dict[str, object]) -> list[dict]:
@@ -224,6 +265,8 @@ class Generator:
         rows: list[dict] = []
         per_position: list[dict] = []
         n_flushed = 0
+        bar = _progress(len(pending), f"draws[{draw_set}]", self.cfg)
+        n_unparsed = 0
 
         def _flush() -> None:
             nonlocal rows, per_position, n_flushed
@@ -272,6 +315,14 @@ class Generator:
                         "chosen_probs": gen.stats.chosen_probs.tolist(),
                     })
                 rows.append(row)
+                bar.update(1)
+                if parsed.vc is None:
+                    # Surfaced live, not only in the post-hoc audit: elicitation
+                    # IS the measurement, so a run quietly failing to parse VC
+                    # is a run producing nothing, and eight hours is a long time
+                    # to wait to discover that.
+                    n_unparsed += 1
+                    bar.set_postfix_str(f"vc unparsed {n_unparsed}")
                 if resume and checkpoint_every and len(rows) >= checkpoint_every:
                     # A 27B model at ~2.4 s/draw is hours of GPU time. Losing it
                     # to a kill signal or an OOM because nothing was written
@@ -280,6 +331,7 @@ class Generator:
                     # valid smaller cache rather than a corrupt one.
                     _flush()
 
+        bar.close()
         if resume:
             _flush()
             # Re-read rather than concatenating in memory: the flushed rows are
@@ -310,7 +362,8 @@ class Generator:
         # overwrite the first pass's audit, and the parse-failure rate is
         # reported per pass.
         self.store.write_json(
-            f"parse_audit__{variant}__T{temperature}__{draw_set}", audit)
+            f"parse_audit__{variant}__T{temperature}__{draw_set}", audit,
+            "generation")
         if per_position:
             # Append-only into the shared raw cache, not the run directory: these
             # arrays cost a decode to recreate, and a resumed run only produces
@@ -343,6 +396,21 @@ class Generator:
         pending = set(zip(todo["q_id"].astype(str), todo["repeat_idx"].astype(int)))
 
         rows: list[dict] = []
+        bar = _progress(len(pending), "vc_pre", self.cfg)
+        # Checkpointed on the same terms as draw_answers. R_pre elicitations on
+        # every question is thousands of calls; writing them only at the end
+        # made a kill signal cost the whole pre-hoc pass, which is the same
+        # failure the post-hoc path was fixed for.
+        checkpoint_every = int(self.cfg.get("generation.checkpoint_every"))
+        n_flushed = 0
+
+        def _flush() -> None:
+            nonlocal rows, n_flushed
+            if rows:
+                self.store.append_vc_pre_repeats(pd.DataFrame(rows))
+                n_flushed += len(rows)
+                rows = []
+
         for _, q in questions.iterrows():
             for repeat_idx in range(r_pre):
                 if (str(q["q_id"]), repeat_idx) not in pending:
@@ -358,20 +426,31 @@ class Generator:
                     "seed": seed, "model": self.model_name,
                     "parse_status": parsed.status,
                 })
+                bar.update(1)
+                if resume and checkpoint_every and len(rows) >= checkpoint_every:
+                    _flush()
 
-        new = pd.DataFrame(rows) if rows else empty_frame(VC_PRE_REPEATS_SCHEMA)
-        if cached is not None and len(cached):
-            out = pd.concat([cached, new], ignore_index=True)
-            out = out.sort_values(["q_id", "repeat_idx"]).reset_index(drop=True)
+        bar.close()
+        if resume:
+            _flush()
+            out = (self.store.cached_vc_pre_repeats(keys)
+                   .sort_values(["q_id", "repeat_idx"]).reset_index(drop=True))
+            n_new = n_flushed
         else:
-            out = new
+            n_new = len(rows)
+            new_df = pd.DataFrame(rows) if rows else empty_frame(VC_PRE_REPEATS_SCHEMA)
+            if cached is not None and len(cached):
+                out = pd.concat([cached, new_df], ignore_index=True)
+                out = out.sort_values(["q_id", "repeat_idx"]).reset_index(drop=True)
+            else:
+                out = new_df
 
-        self.last_resume = {"requested": int(len(keys)), "generated": int(len(new)),
-                            "reused_from_cache": int(len(out)) - int(len(new))}
+        self.last_resume = {"requested": int(len(keys)), "generated": int(n_new),
+                            "reused_from_cache": int(len(out)) - int(n_new)}
         audit = parse_audit_from_status(out["parse_status"])
         audit["prompt_variant"] = variant
         audit["resume"] = dict(self.last_resume)
-        self.store.write_json(f"parse_audit__{variant}", audit)
+        self.store.write_json(f"parse_audit__{variant}", audit, "generation")
         return out
 
 

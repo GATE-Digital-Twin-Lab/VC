@@ -177,6 +177,12 @@ generation:
   # Each flush rewrites the parquet, so this trades a few seconds of IO per
   # checkpoint against how much work a crash can destroy. 0 disables it.
   checkpoint_every: 200
+  # Progress bars during generation (tqdm, on stderr so stdout JSON stays clean).
+  #   auto   -- bar when stderr is a terminal, silent when redirected to a log
+  #   always -- bar even when redirected; throttled to one line every 30s so an
+  #             84k-draw run does not write 84k lines into the log
+  #   never  -- off
+  progress: auto
   # Protocol 6.4 step 3. Phase 1 draws N_MAX on EVERY question (the "classify"
   # pass) and then draws a second, independent N_MAX on the questions in these
   # splits (the "downstream" pass). The first decides in_U; the second is what

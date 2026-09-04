@@ -89,8 +89,11 @@ def _oracle(answers: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 
 def step1_temperature(state: PipelineState) -> PipelineState:
-    cfg, store = state.cfg, state.store
-    gen = Generator(cfg, store)
+    cfg = state.cfg
+    # The generator needs the run-level store (it appends to the shared raw
+    # cache); only the derived tables are phase-scoped.
+    gen = Generator(cfg, state.store)
+    store = state.store.phase("invariance")
     embedder = build_embedder(cfg)
     questions = state.questions
 
@@ -116,8 +119,8 @@ def step1_temperature(state: PipelineState) -> PipelineState:
 
     per_q = invariance.temperature_sweep(cfg, gen, questions, judge_fn)
     summary = invariance.temperature_summary(per_q)
-    store.write_table("phase5_1_temperature_per_question", per_q)
-    store.write_table("phase5_1_temperature_summary", summary)
+    store.write_table("temperature_per_question", per_q)
+    store.write_table("temperature_summary", summary)
     plots.temperature_sweep(per_q, store.figure_path("temperature_sweep"), cfg)
     state.results["step1_temperature"] = summary.to_dict("records")
     return state
@@ -129,7 +132,7 @@ def step1_temperature(state: PipelineState) -> PipelineState:
 
 def step2_gate(state: PipelineState, *, simulate_labels: bool = False,
                labels_path: str | None = None) -> PipelineState:
-    cfg, store = state.cfg, state.store
+    cfg, store = state.cfg, state.store.phase("gate")
     answers, questions = state.answers, state.questions
     embedder = build_embedder(cfg)
 
@@ -150,14 +153,14 @@ def step2_gate(state: PipelineState, *, simulate_labels: bool = False,
         except phase0.LabelCoverageError as exc:
             # Persist the coverage table before failing: the point of refusing is
             # to say which strata still need labelling.
-            store.write_json("phase0_label_coverage", exc.report)
+            store.write_json("label_coverage", exc.report)
             raise
-        store.write_json("phase0_label_coverage", label_report)
+        store.write_json("label_coverage", label_report)
         for w in label_report["warnings"]:
             state.notes.append(f"Phase 0 labels: {w}")
     else:
-        path = store.table_path("phase0_label_sheet")
-        store.write_table("phase0_label_sheet", sheet)
+        path = store.table_path("label_sheet")
+        store.write_table("label_sheet", sheet)
         raise SystemExit(
             f"Phase 0 needs hand labels. Wrote {len(sheet)} stratified pairs to {path}.\n"
             "Fill the correct_human column (TRUE/FALSE), then re-run with\n"
@@ -183,7 +186,7 @@ def step2_gate(state: PipelineState, *, simulate_labels: bool = False,
                                     f"judge.primary={gate.primary}"])
     scored = judge.apply_tau(scored, gate.tau_star)
     state.answers = scored
-    store.write_processed("answers", scored)
+    state.store.write_processed("answers", scored)
 
     state.results["step2_gate"] = {**gate.as_dict(), "labels": label_report}
     if not gate.passed:
@@ -232,7 +235,7 @@ def step3_generate(state: PipelineState,
 # --------------------------------------------------------------------------
 
 def step4_survival(state: PipelineState) -> PipelineState:
-    cfg, store = state.cfg, state.store
+    cfg, store = state.cfg, state.store.phase("survival")
     answers = judge.attach_correct(cfg, state.answers)
     nli = build_nli(cfg)
     answers = cluster.cluster_frame(cfg, answers, nli=nli)
@@ -326,17 +329,17 @@ def step4_survival(state: PipelineState) -> PipelineState:
 
     if cfg.get("judge.primary") == "cos" and state.gate is not None:
         taus = phase0.tau_sensitivity_values(cfg, state.gate.tau_star)
-        store.write_table("phase3_beta_vs_tau",
+        store.write_table("beta_vs_tau",
                           survival.beta_vs_tau(classify, "e_cos", taus))
 
-    store.write_table("phase3_km", km)
-    store.write_table("phase3_hazard", hz)
-    store.write_table("phase3_budget", budget)
-    store.write_table("phase3_u_detection", u_det)
-    store.write_table("phase3_diversity_2x2", twobytwo)
-    store.write_table("phase3_product_rule_curve", curve)
-    store.write_table("phase3_product_rule_divergence", diverg)
-    store.write_json("phase3_summary", {
+    store.write_table("km", km)
+    store.write_table("hazard", hz)
+    store.write_table("budget", budget)
+    store.write_table("u_detection", u_det)
+    store.write_table("diversity_2x2", twobytwo)
+    store.write_table("product_rule_curve", curve)
+    store.write_table("product_rule_divergence", diverg)
+    store.write_json("summary", {
         # Both describe the classification pass, and only that pass: beta is the
         # KM plateau over its K_q, n_in_U counts the questions it never got
         # right. Reported together so a reader can see they agree.
@@ -362,7 +365,7 @@ def step4_survival(state: PipelineState) -> PipelineState:
     # missing column, and would have put every draw of every question into one
     # cluster had it not. Section 1 requires each phase to be re-runnable from
     # the cache; that only holds if each phase writes what the next one reads.
-    store.write_processed("answers", answers)
+    state.store.write_processed("answers", answers)
 
     state.questions = questions
     state.km = km
@@ -375,7 +378,7 @@ def step4_survival(state: PipelineState) -> PipelineState:
     }
     if not flat["flat"]:
         state.notes.append(flat["reason"])
-    store.write_questions(questions)
+    state.store.write_questions(questions)
     return state
 
 
@@ -384,7 +387,7 @@ def step4_survival(state: PipelineState) -> PipelineState:
 # --------------------------------------------------------------------------
 
 def step5_descriptive(state: PipelineState) -> PipelineState:
-    cfg, store = state.cfg, state.store
+    cfg, store = state.cfg, state.store.phase("descriptive")
     # The downstream pass, not the classification pass: Phase 2 describes the
     # draws the rest of the study is certified on.
     answers = _pass(state.answers, "downstream", split="eval")
@@ -400,11 +403,11 @@ def step5_descriptive(state: PipelineState) -> PipelineState:
     br = calibration.brier(answers)
     rho = calibration.error_dependence(answers)
 
-    store.write_table("phase2_vc_hist_post", hist_post)
-    store.write_table("phase2_vc_hist_pre", hist_pre)
-    store.write_table("phase2_reliability", rel)
-    store.write_table("phase2_aurocs", aurocs)
-    store.write_json("phase2_summary", {
+    store.write_table("vc_hist_post", hist_post)
+    store.write_table("vc_hist_pre", hist_pre)
+    store.write_table("reliability", rel)
+    store.write_table("aurocs", aurocs)
+    store.write_json("summary", {
         "discreteness_post": calibration.discreteness_summary(answers, "vc_post"),
         "discreteness_pre": calibration.discreteness_summary(questions, "vc_pre"),
         "monotonicity": mono, "variance_decomposition": var,
@@ -429,7 +432,7 @@ def step5_descriptive(state: PipelineState) -> PipelineState:
 # --------------------------------------------------------------------------
 
 def step6_clm(state: PipelineState) -> PipelineState:
-    cfg, store = state.cfg, state.store
+    cfg, store = state.cfg, state.store.phase("clm")
     answers, questions = state.answers, state.questions
     n_max = int(cfg.get("generation.n_max"))
     embedder = build_embedder(cfg)
@@ -486,10 +489,10 @@ def step6_clm(state: PipelineState) -> PipelineState:
                                                 float(alpha), lam, by=by)
                     if len(strat):
                         store.write_table(
-                            f"phase4_discount_stability__alpha{alpha}__{by}", strat)
+                            f"discount_stability__alpha{alpha}__{by}", strat)
 
     headline = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-    store.write_table("phase4_headline", headline)
+    store.write_table("headline", headline)
 
     # Robustness pass (protocol 7.1). The primary table conditions on
     # solvability, which is information unavailable at deployment. This repeats
@@ -525,10 +528,10 @@ def step6_clm(state: PipelineState) -> PipelineState:
             if len(res.headline):
                 rob_rows.append(res.headline.assign(alpha=alpha))
         if rob_rows:
-            store.write_table("phase4_robustness_headline",
+            store.write_table("robustness_headline",
                               pd.concat(rob_rows, ignore_index=True))
-        store.write_json("phase4_robustness_summary", rob_meta)
-    store.write_json("phase4_summary", {"beta_used": beta_eff,
+        store.write_json("robustness_summary", rob_meta)
+    store.write_json("summary", {"beta_used": beta_eff,
                                         "restricted_to_A": bool(cfg.get("phase4.restrict_to_A")),
                                         "quality_score": cfg.get("phase4.quality_score"),
                                         "per_alpha": per_alpha})
@@ -551,17 +554,18 @@ def step7_invariance_transfer(state: PipelineState) -> PipelineState:
     out: dict = {}
 
     per_q, para = invariance.paraphrase_reliability(cfg, gen, probe_q)
-    store.write_table("phase5_2_paraphrase_per_question", per_q)
+    state.store.phase("invariance").write_table("paraphrase_per_question", per_q)
     out["paraphrase"] = para
 
     eval_answers = _pass(state.answers, "downstream", split="eval")
     table, tsum = transfer.transfer_study(cfg, eval_answers)
-    store.write_table("phase6_transfer", table)
+    xfer = state.store.phase("transfer")
+    xfer.write_table("transfer", table)
     compounding = transfer.isotonic_preserves_compounding(cfg, eval_answers)
-    store.write_table("phase6_isotonic_compounding", compounding)
+    xfer.write_table("isotonic_compounding", compounding)
     out["transfer"] = tsum
 
-    store.write_json("phase5_summary", out)
+    state.store.phase("invariance").write_json("summary", out)
     state.results["step7"] = out
     return state
 

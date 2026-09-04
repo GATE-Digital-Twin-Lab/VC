@@ -8,12 +8,40 @@ functions of it (protocol section 1). Timestamping it would mean every run
 re-samples from scratch, which defeats the design; re-running generation against
 an existing cache is instead a no-op on rows already present.
 
-``results/runs/<timestamp>__<name>/`` is per-run and holds everything DERIVED:
-tables, figures, and processed parquet. Those are cheap to recompute and change
-whenever a knob changes, so each run gets its own directory and nothing is
-silently overwritten. Each run directory carries a ``manifest.json`` and a
-snapshot of the exact resolved config, because a results table without the knobs
-that produced it is not reproducible.
+``results/runs/<timestamp>__<name>/`` is per-run and holds everything DERIVED.
+Those are cheap to recompute and change whenever a knob changes, so each run
+gets its own directory and nothing is silently overwritten. Each run directory
+carries a ``manifest.json`` and a snapshot of the exact resolved config, because
+a results table without the knobs that produced it is not reproducible.
+
+**One directory per phase**, because a single flat ``tables/`` reached 28 files
+and stopped being readable:
+
+    manifest.json  config.snapshot.yaml
+    processed/              answers.parquet, questions.parquet
+    run/                    splits, pitfalls, notes -- not owned by one phase
+    phase0_gate/            gate.json, tau_sweep.csv, label_*.csv
+    phase1_generation/      parse audits
+    phase2_descriptive/     reliability, AUROCs, histograms
+    phase3_survival/        KM, hazard, budget, U detection, product rule
+    phase4_clm/             LTT headline, discount stability
+    phase5_invariance/      temperature and paraphrase sweeps
+    phase6_transfer/        isotonic transfer
+
+A phase's FIGURES sit beside its tables rather than in a separate ``figures/``
+tree: ``km.csv`` and ``km.png`` are one result in two renderings, and splitting
+them meant every question about a figure started by guessing which of two
+directories it was in. Directories are numbered by PROTOCOL section, not by
+execution order -- the pipeline runs generation before the gate (see
+``pipeline``), and a second numbering would be one too many.
+
+``processed/`` stays at the run root and is deliberately NOT under a phase: it
+is the handoff between phases (Phase 0 writes correctness onto it, Phase 3 adds
+clusters, Phase 4 reads it), so filing it under whichever phase happened to
+touch it last would misdescribe what it is.
+
+Phase directories are created on first write, so a run that stopped after the
+gate does not grow seven empty folders implying work that never happened.
 
 Phase-by-phase CLI use still works: ``vc_uq generate`` creates a run directory
 and later commands attach to the most recent one for that run name unless told
@@ -43,6 +71,20 @@ from .schemas import (ANSWER_KEY, ANSWERS_SCHEMA, PER_POSITION_SCHEMA,
 MANIFEST_NAME = "manifest.json"
 CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
 LATEST_POINTER = "LATEST"
+
+# Keyed by NAME, not number. Phase numbers and pipeline step numbers already
+# disagree in this codebase (protocol Phase 0 is step 2); a third numbering
+# addressed by callers would be worse than a word.
+PHASE_DIRS = {
+    "run": "run",
+    "gate": "phase0_gate",
+    "generation": "phase1_generation",
+    "descriptive": "phase2_descriptive",
+    "survival": "phase3_survival",
+    "clm": "phase4_clm",
+    "invariance": "phase5_invariance",
+    "transfer": "phase6_transfer",
+}
 
 
 def timestamp(cfg: Config) -> str:
@@ -112,8 +154,6 @@ class Store:
             self.run_dir = runs_root(cfg) / f"{self.run_id}__{self.run}"
 
         self.raw_dir = cfg.raw_dir
-        self.tables_dir = self.run_dir / "tables"
-        self.figures_dir = self.run_dir / "figures"
         self.processed_dir = self.run_dir / "processed"
 
         if create:
@@ -121,8 +161,10 @@ class Store:
 
     # -- lifecycle ---------------------------------------------------------
     def _create(self) -> None:
-        for d in (self.raw_dir, self.tables_dir, self.figures_dir,
-                  self.processed_dir):
+        # Phase directories are NOT created here. An empty phase4_clm/ in a run
+        # that stopped after the gate reads as "Phase 4 produced nothing", which
+        # is a different claim from "Phase 4 never ran".
+        for d in (self.raw_dir, self.processed_dir):
             d.mkdir(parents=True, exist_ok=True)
         if not (self.run_dir / CONFIG_SNAPSHOT_NAME).exists():
             self.snapshot_config()
@@ -228,14 +270,36 @@ class Store:
     def processed_path(self, table: str) -> Path:
         return self.processed_dir / f"{table}.parquet"
 
-    def table_path(self, name: str) -> Path:
-        return self.tables_dir / f"{name}.csv"
+    def phase_dir(self, phase: str) -> Path:
+        """The directory for one phase, created on demand."""
+        try:
+            leaf = PHASE_DIRS[phase]
+        except KeyError:
+            raise KeyError(
+                f"unknown phase {phase!r}; expected one of {sorted(PHASE_DIRS)}"
+            ) from None
+        d = self.run_dir / leaf
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-    def figure_path(self, name: str) -> Path:
-        return self.figures_dir / f"{name}.png"
+    def phase(self, phase: str) -> "PhaseStore":
+        """A writer scoped to one phase.
 
-    def json_path(self, name: str) -> Path:
-        return self.tables_dir / f"{name}.json"
+        Each pipeline step opens one of these at the top and writes everything
+        through it, so an artifact cannot be filed under the wrong phase by
+        forgetting a prefix -- the scope is lexical rather than a name pattern
+        matched at write time.
+        """
+        return PhaseStore(self, phase)
+
+    def table_path(self, name: str, phase: str = "run") -> Path:
+        return self.phase_dir(phase) / f"{name}.csv"
+
+    def figure_path(self, name: str, phase: str = "run") -> Path:
+        return self.phase_dir(phase) / f"{name}.png"
+
+    def json_path(self, name: str, phase: str = "run") -> Path:
+        return self.phase_dir(phase) / f"{name}.json"
 
     # -- raw (append-only) -------------------------------------------------
     def append_raw(self, table: str, df: pd.DataFrame, schema, key) -> pd.DataFrame:
@@ -410,21 +474,135 @@ class Store:
         df.to_parquet(path, index=False)
         return path
 
-    def write_table(self, name: str, df: pd.DataFrame) -> Path:
-        path = self.table_path(name)
+    def write_table(self, name: str, df: pd.DataFrame, phase: str = "run") -> Path:
+        path = self.table_path(name, phase)
         df.to_csv(path, index=False)
         return path
 
-    def write_json(self, name: str, payload: dict) -> Path:
-        path = self.json_path(name)
+    def write_json(self, name: str, payload: dict, phase: str = "run") -> Path:
+        path = self.json_path(name, phase)
         path.write_text(json.dumps(payload, indent=2, default=_jsonable), encoding="utf-8")
         return path
 
-    def read_json(self, name: str) -> dict:
-        path = self.json_path(name)
+    def read_json(self, name: str, phase: str = "run") -> dict:
+        path = self.json_path(name, phase)
         if not path.exists():
             raise FileNotFoundError(f"{path} not found; run the phase that produces it")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def find(self, name: str) -> Path | None:
+        """Locate an artifact by stem across every phase directory.
+
+        For interactive use and for reading a run written before the layout was
+        split by phase. Returns None rather than raising, so a caller can say
+        which phase it expected.
+        """
+        for leaf in list(PHASE_DIRS.values()) + ["tables", "figures"]:
+            d = self.run_dir / leaf
+            if not d.is_dir():
+                continue
+            for ext in (".csv", ".json", ".png"):
+                p = d / f"{name}{ext}"
+                if p.exists():
+                    return p
+        return None
+
+
+class PhaseStore:
+    """A :class:`Store` scoped to one phase's output directory.
+
+    Holds no state of its own beyond the phase name -- every write goes to the
+    underlying store, so a phase view and the run it belongs to can never
+    disagree about where the run directory is.
+    """
+
+    __slots__ = ("store", "phase")
+
+    def __init__(self, store: "Store", phase: str):
+        if phase not in PHASE_DIRS:
+            raise KeyError(
+                f"unknown phase {phase!r}; expected one of {sorted(PHASE_DIRS)}")
+        self.store = store
+        self.phase = phase
+
+    @property
+    def dir(self) -> Path:
+        return self.store.phase_dir(self.phase)
+
+    def table_path(self, name: str) -> Path:
+        return self.store.table_path(name, self.phase)
+
+    def figure_path(self, name: str) -> Path:
+        return self.store.figure_path(name, self.phase)
+
+    def json_path(self, name: str) -> Path:
+        return self.store.json_path(name, self.phase)
+
+    def write_table(self, name: str, df: pd.DataFrame) -> Path:
+        return self.store.write_table(name, df, self.phase)
+
+    def write_json(self, name: str, payload: dict) -> Path:
+        return self.store.write_json(name, payload, self.phase)
+
+    def read_json(self, name: str) -> dict:
+        return self.store.read_json(name, self.phase)
+
+    def __repr__(self) -> str:
+        return f"PhaseStore({self.phase!r}, {self.store.run_dir.name!r})"
+
+
+def migrate_layout(run_dir: Path, *, dry_run: bool = False) -> list[tuple[Path, Path]]:
+    """Move a flat ``tables/``+``figures/`` run into per-phase directories.
+
+    Idempotent: a run already in the new layout yields no moves. Routing is by
+    the ``phaseN_`` prefix the old names carried, plus an explicit table for the
+    artifacts that never had one. The prefix is stripped on the way, since the
+    directory now says it.
+
+    Anything unrecognised goes to ``run/`` rather than being left behind, so the
+    old directories can be removed once empty and no file is ever dropped.
+    """
+    by_prefix = {
+        "phase0_": "gate", "phase2_": "descriptive", "phase3_": "survival",
+        "phase4_": "clm", "phase5_": "invariance", "phase6_": "transfer",
+    }
+    by_name = {
+        "dataset_splits": "run", "dataset_split_deviation": "run",
+        "pitfalls": "run", "pitfalls_summary": "run", "run_notes": "run",
+        "nli_audit": "survival",
+        # Figures were never phase-prefixed.
+        "km": "survival", "hazard": "survival", "product_rule": "survival",
+        "budget_collapse": "survival", "reliability": "descriptive",
+        "vc_hist_post": "descriptive", "temperature_sweep": "invariance",
+    }
+    moves: list[tuple[Path, Path]] = []
+    for leaf in ("tables", "figures"):
+        src_dir = run_dir / leaf
+        if not src_dir.is_dir():
+            continue
+        for src in sorted(src_dir.iterdir()):
+            if not src.is_file():
+                continue
+            stem = src.stem
+            phase = by_name.get(stem)
+            if phase is None and stem.startswith("parse_audit__"):
+                phase = "generation"
+            if phase is None:
+                for pre, ph in by_prefix.items():
+                    if stem.startswith(pre):
+                        phase, stem = ph, stem[len(pre):]
+                        break
+            if phase is None:
+                phase = "run"
+            dest_dir = run_dir / PHASE_DIRS[phase]
+            dest = dest_dir / f"{stem}{src.suffix}"
+            moves.append((src, dest))
+            if not dry_run:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                src.replace(dest)
+        if not dry_run and src_dir.is_dir() and not any(src_dir.iterdir()):
+            src_dir.rmdir()
+    return moves
 
 
 def run_summaries(cfg: Config, *, name: str | None = None) -> pd.DataFrame:

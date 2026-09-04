@@ -26,7 +26,7 @@ import pandas as pd
 
 from .config import Config
 from .stats import NAN as NAN_, auroc, cohens_kappa
-from .store import Store
+from .store import PhaseStore, Store  # noqa: F401  (PhaseStore used in annotations)
 
 # A hand label identifies ONE answer, and (q_id, draw_idx) stopped identifying
 # one the moment generation grew a second pass (protocol 6.4): draw 3 of the
@@ -405,7 +405,7 @@ def null_band(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
     return out
 
 
-def run_gate(cfg: Config, store: Store, labelled: pd.DataFrame,
+def run_gate(cfg: Config, store: "Store | PhaseStore", labelled: pd.DataFrame,
              answers: pd.DataFrame, questions: pd.DataFrame,
              embedder=None) -> GateResult:
     y = labelled["correct_human"].astype(bool).to_numpy()
@@ -458,8 +458,8 @@ def run_gate(cfg: Config, store: Store, labelled: pd.DataFrame,
         reasons.append(f"AUROC({primary}) = {au:.3f} < {auroc_min} even after fallback")
 
     sens = float(cfg.get("phase0.tau_sensitivity"))
-    store.write_table("phase0_tau_sweep", sweep_cos)
-    store.write_json("phase0_gate", {
+    store.write_table("tau_sweep", sweep_cos)
+    store.write_json("gate", {
         **GateResult(passed, kappa, au, tau_star, primary, reasons).as_dict(),
         "auroc_cos": float(auroc_cos), "auroc_nli": auroc_nli,
         "null_band": nb,

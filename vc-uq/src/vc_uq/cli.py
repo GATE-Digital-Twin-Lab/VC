@@ -19,7 +19,13 @@ directory, alongside the exact config that produced it:
   results/runs/<timestamp>__<run.name>/
       manifest.json           what ran, when, on which model, at which git rev
       config.snapshot.yaml    the fully resolved config, overrides included
-      tables/  figures/  processed/
+      processed/              the parquet handoff between phases
+      run/                    splits, pitfalls, notes
+      phase0_gate/ phase1_generation/ phase2_descriptive/ phase3_survival/
+      phase4_clm/ phase5_invariance/ phase6_transfer/
+
+Each phase directory holds that phase's tables AND its figures, numbered by
+protocol section and created on first write.
 
 The raw generation cache is deliberately NOT in there. It lives in data/raw/,
 shared across runs and keyed by run.name, because re-sampling it is the one

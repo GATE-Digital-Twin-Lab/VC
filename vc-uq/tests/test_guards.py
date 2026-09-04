@@ -763,7 +763,7 @@ def test_parse_audit_covers_cached_rows_not_just_new_ones(cfg):
 
     variant = c.get("generation.prompt_variant_post")
     T = c.get("generation.temperature")
-    audit = _json.loads((store.tables_dir
+    audit = _json.loads((store.phase_dir("generation")
                          / f"parse_audit__{variant}__T{T}__classify.json")
                         .read_text(encoding="utf-8"))
     assert audit["n"] == 3 * len(questions)
@@ -1856,6 +1856,63 @@ def test_generation_checkpoints_so_a_crash_keeps_completed_draws(cfg):
     assert gen2.last_resume["generated"] == 4 * 8 - len(survived)
 
 
+def test_vc_pre_checkpoints_so_a_crash_keeps_completed_elicitations(cfg):
+    """R_pre elicitations on every question is thousands of calls.
+
+    The post-hoc path was fixed for this; the pre-hoc path kept accumulating in
+    memory, so a kill signal still cost the whole vc_pre pass.
+    """
+    from vc_uq.datasets import build_questions
+    from vc_uq.generate import Generator
+    from vc_uq.store import Store
+
+    c = cfg.with_overrides(["generation.checkpoint_every=4", "generation.r_pre=6"])
+    store = Store(c)
+    qs = build_questions(c).head(4)
+
+    gen = Generator(c, store)
+    n = {"n": 0}
+    real_call = gen._call
+
+    def die_after_10(*a, **k):
+        n["n"] += 1
+        if n["n"] > 10:
+            raise RuntimeError("node evicted")
+        return real_call(*a, **k)
+
+    gen._call = die_after_10
+    with pytest.raises(RuntimeError, match="node evicted"):
+        gen.draw_vc_pre(qs, resume=True)
+
+    survived = store.read_vc_pre_repeats()
+    assert len(survived) >= 8, \
+        f"only {len(survived)} elicitations survived; checkpointing did nothing"
+
+    out = Generator(c, store).draw_vc_pre(qs, resume=True)
+    assert len(out) == 4 * 6
+
+
+def test_progress_bar_is_silent_when_stderr_is_not_a_terminal(cfg):
+    """A bar sized by cache HITS would read 95% instantly and then crawl.
+
+    It is sized by the pending set, and it stays out of redirected logs: at 84k
+    draws an unthrottled bar writes 84k lines into the log file.
+    """
+    from vc_uq.generate import _NullBar, _progress
+
+    # pytest captures stderr, so isatty() is False -> auto means silent.
+    assert isinstance(_progress(100, "d", cfg), _NullBar)
+    assert isinstance(_progress(0, "d", cfg.with_overrides(
+        ["generation.progress=always"])), _NullBar), "nothing pending, no bar"
+    assert isinstance(_progress(100, "d", cfg.with_overrides(
+        ["generation.progress=never"])), _NullBar)
+
+    bar = _progress(100, "d", cfg.with_overrides(["generation.progress=always"]))
+    assert not isinstance(bar, _NullBar)
+    assert bar.total == 100
+    bar.close()
+
+
 def test_shards_are_disjoint_exhaustive_and_order_independent():
     from vc_uq.generate import shard_questions
 
@@ -2217,7 +2274,7 @@ def test_censoring_and_U_are_the_same_question_answered_once(cfg):
     assert list(q["in_U"].astype(bool)) == list(q["censored"].astype(bool)), \
         "in_U and censored disagree, so one of them is reading the wrong pass"
 
-    summary = _json.loads((state.store.tables_dir / "phase3_summary.json")
+    summary = _json.loads((state.store.phase_dir("survival") / "summary.json")
                           .read_text(encoding="utf-8"))
     assert summary["draw_set_for_U"] == "classify"
     assert summary["n_in_U"] == int(q["censored"].astype(bool).sum()), \
