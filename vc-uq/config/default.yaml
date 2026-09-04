@@ -404,6 +404,41 @@ aggregation:
   one_minus_vc_floor: 1.0e-6
 
 judge:
+  # Answer normalisation, applied to the TEXT BEFORE IT IS EMBEDDED.
+  #
+  # Without it the criterion scores "7" against a gold "Seven" at e_cos = 0.84
+  # and calls it wrong -- and bidirectional NLI agrees, so switching criteria
+  # does not catch it. On the eval split this put roughly a tenth to a third of
+  # the apparently-inconsistent questions (some draws right, some wrong) into
+  # that state for spelling reasons alone, and it inflates beta by counting
+  # answered questions as never-correct.
+  #
+  # CHANGING ANY OF THESE MOVES e_cos, WHICH INVALIDATES tau_star. Re-run the
+  # Phase 0 gate after touching them; the gate records the settings it selected
+  # under in its own report so a stale threshold is visible rather than silent.
+  normalise:
+    enabled: true
+    case: true
+    punctuation: true         # "St. Martin's" -> "st martins"
+    articles: true            # leading the/a/an only, never mid-string
+    # Diacritics and ligatures: "La Boheme"/"La Boheme", "Le Carre"/"Le Carre",
+    # "Nadia Comaneci". Folds combining marks and maps the standalone letters
+    # NFKD leaves alone (oe, ae, o-stroke, sharp-s). It does NOT delete the
+    # non-ASCII range: erasing a non-Latin answer to "" would make two unrelated
+    # answers identical, a false positive in the criterion itself.
+    accents: true
+    numerals: true            # "Seven" <-> "7", small numbers only
+  equivalence:
+    # Accept an answer whose tokens are a subset (or superset) of the gold
+    # answer's: rescues "Orton" for "Joe Orton" and "Jones" for "James Jones",
+    # which cosine puts at 0.63 and NLI also rejects.
+    #
+    # OFF BY DEFAULT, and on its own flag rather than folded into `normalise`,
+    # because the same rule accepts "Bridge" for "Bridge Over Troubled Water" --
+    # an incomplete answer, not a differently spelled one. Turning it on trades
+    # a known false-negative class for a known false-positive class. Report
+    # which one you used.
+    token_subset: false
   primary: cos                # cos | nli ; Phase 0 flips this to nli if AUROC < gate
   tau_star: null              # filled by Phase 0; null means "not yet validated"
 

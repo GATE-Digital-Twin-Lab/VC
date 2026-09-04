@@ -2279,3 +2279,165 @@ def test_censoring_and_U_are_the_same_question_answered_once(cfg):
     assert summary["draw_set_for_U"] == "classify"
     assert summary["n_in_U"] == int(q["censored"].astype(bool).sum()), \
         "beta and n_in_U are reported side by side; they must describe one thing"
+
+
+# --------------------------------------------------------------------------
+# Answer normalisation and equivalence overrides
+# --------------------------------------------------------------------------
+
+def test_normalisation_collapses_the_formatting_the_criterion_should_ignore():
+    """The observed failure class, pinned case by case.
+
+    Every pair here was scored WRONG by cosine at tau_star = 0.37 on a real run,
+    and bidirectional NLI agreed on all of them -- so this is not something a
+    change of criterion fixes.
+    """
+    from vc_uq.judge import normalise_answer as n
+
+    for a, b in [("Seven", "7"), ("Four", "4"), ("Twenty", "20"),
+                 ("The Wash", "Wash"), ("St. Martin's", "St Martins"),
+                 ("A Fury", "a fury"), ("Music Man", "The Music Man"),
+                 # num2words supplies both the cardinal and the spoken-year
+                 # form; a hand-listed table had neither.
+                 ("twenty-one", "21"), ("Twenty One", "21"),
+                 ("nineteen sixty-nine", "1969"),
+                 ("One Thousand, Nine Hundred and Sixty-Nine", "1969")]:
+        assert n(a) == n(b), f"{a!r} and {b!r} are the same answer"
+
+    # ...and it must not collapse answers that genuinely differ.
+    assert n("Paris") != n("London")
+    assert n("Joe Orton") != n("Orton"), \
+        "token-level differences are the equivalence rule's job, not normalisation's"
+
+
+def test_numerals_match_the_whole_string_only():
+    """The rejected design, pinned so it cannot come back.
+
+    Parsing arbitrary text for numbers (word2number) accepts 8 of the 4,323
+    distinct answers on the real corpus and is WRONG on 5 of them. Collapsing a
+    film title to a digit would merge unrelated answers and make each correct
+    for the other -- a false positive in the correctness criterion itself, which
+    is the one place this study cannot afford one.
+    """
+    from vc_uq.judge import normalise_answer as n
+
+    for title in ["Seven Samurai", "Marine One", "Million Dollar Baby",
+                  "Four Weddings and a Funeral", "One Direction"]:
+        assert not n(title).isdigit(), f"{title!r} was parsed as a number"
+    assert n("Seven Samurai") != n("7 Samurai")
+
+
+def test_normalisation_off_is_exactly_the_old_behaviour(cfg):
+    """The disabled path is identity, not a near-identity.
+
+    A normaliser that still lowercased when switched off would silently change
+    every historical run's e_cos while claiming to be inert.
+    """
+    from vc_uq.judge import normaliser
+
+    off = normaliser(cfg.with_overrides(["judge.normalise.enabled=false"]))
+    for t in ("Seven", "The Wash", "St. Martin's", "  spaced  ", "MiXeD"):
+        assert off(t) == str(t)
+
+
+def test_token_subset_is_off_by_default_and_declared_when_on(cfg):
+    """It rescues surnames and accepts incomplete titles. Both, or neither."""
+    from vc_uq.judge import equivalence_mask, token_subset_equivalent
+
+    assert token_subset_equivalent("Orton", "Joe Orton")
+    assert token_subset_equivalent("Jones", "James Jones")
+    # The price of the rule above, pinned so it cannot be forgotten.
+    assert token_subset_equivalent("Bridge", "Bridge Over Troubled Water")
+    assert not token_subset_equivalent("Paris", "London")
+
+    answers, refs = ["Orton"], ["Joe Orton"]
+    assert not equivalence_mask(cfg, answers, refs).any(), \
+        "token_subset must default to off: it trades false negatives for false positives"
+    on = cfg.with_overrides(["judge.equivalence.token_subset=true"])
+    assert equivalence_mask(on, answers, refs).all()
+
+
+def test_tau_is_selected_against_the_predicate_the_phases_apply(cfg):
+    """`tau_sweep` and `apply_tau` must be one rule.
+
+    With an equivalence override enabled, a sweep on `e_cos <= tau` alone would
+    choose tau_star to optimise a rule no downstream phase uses -- and nothing
+    would raise, because both halves are individually sensible.
+    """
+    from vc_uq import phase0
+    from vc_uq.judge import apply_tau
+
+    on = cfg.with_overrides(["judge.equivalence.token_subset=true"])
+    # One labelled pair the human called correct that the DISTANCE calls wrong,
+    # and that only the override rescues.
+    labelled = pd.DataFrame({
+        "q_id": ["q0", "q1"], "draw_set": ["classify"] * 2, "draw_idx": [0, 1],
+        "e_cos": [0.9, 0.01], "answer_equivalent": [True, False],
+        "correct_human": [True, True],
+    })
+    sweep = phase0.tau_sweep(labelled, on, "e_cos")
+    at_low_tau = sweep[np.isclose(sweep["tau"], 0.10)].iloc[0]
+    assert at_low_tau["accuracy"] == 1.0, \
+        "the sweep ignored the override, so tau_star optimises the wrong rule"
+
+    scored = apply_tau(labelled, 0.10)
+    assert list(scored["correct_cos"].astype(bool)) == [True, True], \
+        "apply_tau and tau_sweep disagree about what correct means"
+
+
+def test_equivalence_column_is_written_even_when_the_rule_is_off(cfg):
+    """Present and all-False, so the parquet records which criterion ran."""
+    from vc_uq.judge import equivalence_mask
+
+    mask = equivalence_mask(cfg, ["Orton", "Paris"], ["Joe Orton", "Paris"])
+    assert mask.dtype == bool and len(mask) == 2
+    assert not mask.any()
+
+
+def test_normalisation_makes_spelling_variants_score_identically(cfg):
+    """End to end through the embedding space, not just the string helper.
+
+    The space is keyed on normalised text and looked up through the same
+    function, so a caller passing raw answers cannot desynchronise the two.
+    """
+    from vc_uq.judge import build_embedding_space
+
+    space = build_embedding_space(cfg, ["Seven", "7", "Paris"])
+    assert np.allclose(space.get(["Seven"]), space.get(["7"])), \
+        "'Seven' and '7' must land on one vector once normalisation is on"
+    assert not np.allclose(space.get(["Seven"]), space.get(["Paris"]))
+
+
+def test_accent_folding_unifies_spellings_without_erasing_scripts():
+    """Diacritics are a spelling difference, not an answer difference.
+
+    "Le Carre" written with the acute scored e_cos = 1.058 against the gold
+    "John Le Carre" -- further apart than two unrelated strings -- and the
+    question was counted as never-correct on that basis.
+    """
+    from vc_uq.judge import normalise_answer as n
+
+    for a, b in [("La Bohème", "La Boheme"),
+                 ("Ilie Năstase", "Ilie Nastase"),
+                 ("Nadia Comăneci", "Nadia Comaneci"),
+                 ("Le Carré", "Le Carre"),
+                 # NFKD leaves these alone; the explicit ligature map catches them.
+                 ("Le Cœur", "Le Coeur"), ("Straße", "Strasse")]:
+        assert n(a) == n(b), f"{a!r} and {b!r} differ only in spelling"
+
+    # Folding must not be "delete the non-ASCII range". Two unrelated answers
+    # that both collapsed to "" would be identical, which is a false positive in
+    # the correctness criterion -- the one error this study cannot absorb.
+    assert n("Пари́ж") == "париж"
+    assert n("東京") == "東京"
+    assert n("Москва") != n("東京")
+    assert n("Paris") != n("London")
+
+
+def test_accent_folding_can_be_switched_off(cfg):
+    from vc_uq.judge import normaliser
+
+    off = normaliser(cfg.with_overrides(["judge.normalise.accents=false"]))
+    assert off("La Bohème") != off("La Boheme")
+    on = normaliser(cfg)
+    assert on("La Bohème") == on("La Boheme")

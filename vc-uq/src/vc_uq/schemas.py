@@ -51,6 +51,10 @@ ANSWERS_SCHEMA: dict[str, tuple[str, bool]] = {
     "e_cos": ("Float64", True),            # 1 - cos(emb(a_i), emb(a_star)) -- CRITERION
     "s_anchor": ("Float64", True),         # 1 - cos(emb(anchor(q)), emb(a_i)) -- SCORE
     "s_anchor_rank": ("Float64", True),    # within-split rank transform of s_anchor
+    # A property of the (answer, a_star) pair, not of either alone, so it cannot
+    # be folded into the embedding. All-False when the rule is off; present
+    # either way so the parquet records which criterion produced correct_cos.
+    "answer_equivalent": ("boolean", True),
     "correct_cos": ("boolean", True),
     "correct_nli": ("boolean", True),
     "correct_human": ("boolean", True),    # Phase 0 subset only

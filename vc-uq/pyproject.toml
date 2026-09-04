@@ -16,6 +16,11 @@ dependencies = [
     "pyyaml>=6",
     "matplotlib>=3.7",
     "tqdm>=4.66",
+    # Generates the numeral word forms the correctness criterion normalises
+    # over ("Seven" <-> "7", "nineteen sixty-nine" <-> "1969"). A core
+    # dependency, not an extra: it is part of how correct_cos is defined, so a
+    # run without it would silently apply a different criterion.
+    "num2words>=0.5.13",
 ]
 
 [project.optional-dependencies]

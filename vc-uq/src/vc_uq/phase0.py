@@ -73,8 +73,16 @@ def build_label_sheet(cfg: Config, answers: pd.DataFrame,
         #
         # Deduplicated BEFORE the deciles are cut, so the strata span distinct
         # pairs rather than distinct draws.
+        #
+        # On the NORMALISED answer, which is what the criterion now compares:
+        # "Seven" and "7" carry one e_cos and would get one human verdict, so
+        # keying on raw text would spend two labels to learn one thing.
+        from .judge import normaliser
+        norm = normaliser(cfg)
+        sub = sub.assign(_norm=sub["answer"].astype(str).map(norm))
         sub = (sub.sort_values(["q_id", "draw_set", "draw_idx"])
-               .drop_duplicates(subset=["q_id", "answer"], keep="first"))
+               .drop_duplicates(subset=["q_id", "_norm"], keep="first")
+               .drop(columns="_norm"))
 
     sub["e_bin"] = sub.groupby("dataset")["e_cos"].transform(
         lambda s: pd.qcut(s.rank(method="first"), min(n_bins, max(1, s.nunique())),
@@ -296,13 +304,21 @@ def simulate_human_labels(sheet: pd.DataFrame, answers: pd.DataFrame,
 
 def tau_sweep(labelled: pd.DataFrame, cfg: Config,
               score_col: str = "e_cos") -> pd.DataFrame:
+    """Sweep tau against the hand labels, using the SAME predicate the phases do.
+
+    Through ``judge.correct_by_cosine`` rather than a bare ``s <= tau``: with an
+    equivalence override enabled, a sweep on the distance alone would select
+    ``tau_star`` to optimise a rule no downstream phase applies.
+    """
+    from .judge import correct_by_cosine
+
     grid = cfg.section("phase0.tau_grid")
     taus = np.arange(grid["start"], grid["stop"] + 1e-9, grid["step"])
     y = labelled["correct_human"].astype(bool).to_numpy()
-    s = labelled[score_col].to_numpy(dtype=float)
     rows = []
     for tau in taus:
-        pred = s <= tau
+        pred = correct_by_cosine(labelled, float(tau),
+                                 column=score_col).fillna(False).to_numpy(dtype=bool)
         rows.append({"tau": float(tau), "kappa": cohens_kappa(pred, y),
                      "accuracy": float((pred == y).mean()),
                      "predicted_positive_rate": float(pred.mean())})
@@ -464,6 +480,17 @@ def run_gate(cfg: Config, store: "Store | PhaseStore", labelled: pd.DataFrame,
         "auroc_cos": float(auroc_cos), "auroc_nli": auroc_nli,
         "null_band": nb,
         "tau_sensitivity_grid": [tau_star - sens, tau_star, tau_star + sens],
+        # tau_star is only meaningful together with the text treatment it was
+        # selected under -- normalisation moves e_cos, as the run that reused a
+        # stale tau across two embedding spaces demonstrated.
+        "criterion": {
+            "normalise": dict(cfg.get("judge.normalise", {})),
+            "token_subset_equivalence": bool(
+                cfg.get("judge.equivalence.token_subset", False)),
+            "n_equivalence_overrides": int(
+                labelled["answer_equivalent"].astype("boolean").fillna(False).sum())
+            if "answer_equivalent" in labelled.columns else 0,
+        },
         "n_labelled": int(len(labelled)),
         "label_source": (labelled["label_source"].iloc[0]
                          if "label_source" in labelled.columns else "human"),

@@ -20,7 +20,11 @@ circularity guard below refuses that configuration outright.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -28,6 +32,230 @@ import pandas as pd
 from .backends import build_embedder, build_nli
 from .backends.base import cosine_distance, pairwise_cosine_distance
 from .config import Config
+
+
+# --------------------------------------------------------------------------
+# Answer normalisation
+# --------------------------------------------------------------------------
+
+_ARTICLE_RE = re.compile(r"^(?:the|a|an)\s+")
+
+# Letters Unicode treats as their own, not as a base plus a combining mark, so
+# NFKD leaves them alone: "Coeur" and "Coeur" with the ligature never meet
+# without an explicit map. Standard ASCII-folding pairs, the same set a search
+# index would use.
+#
+# Inert on the corpus this was written against -- the only ligatures present sit
+# in model answers to fabricated questions whose gold is "No such entity
+# exists", so no PAIR is unified by them. Included because the rule is correct
+# in general and the corpus is not fixed, not because it changed a number here.
+_LIGATURES = {
+    "\u0153": "oe", "\u0152": "oe",   # oe
+    "\u00e6": "ae", "\u00c6": "ae",   # ae
+    "\u00f8": "o", "\u00d8": "o",     # o with stroke
+    "\u00df": "ss",                    # sharp s
+    "\u0111": "d", "\u0110": "d",     # d with stroke
+    "\u0142": "l", "\u0141": "l",     # l with stroke
+    "\u00fe": "th", "\u00de": "th",   # thorn
+    "\u00f0": "d", "\u00d0": "d",     # eth
+}
+_LIGATURE_TABLE = str.maketrans(_LIGATURES)
+
+
+def fold_accents(text) -> str:
+    """Drop diacritics, keeping the letters underneath.
+
+    "La Boheme" and "La Boheme" with the grave, "Nastase" and "Nastase" with the
+    breve, "Comaneci" and "Comaneci" -- the criterion scored the accented and
+    unaccented spellings of these as DIFFERENT answers, and one of them
+    ("Le Carre" for "John Le Carre") landed at e_cos = 1.058, further apart than
+    two unrelated strings.
+
+    Decomposition-and-drop rather than "delete anything non-ASCII": stripping
+    the high range outright would erase a non-Latin answer down to the empty
+    string, and two unrelated answers that both became "" would then be
+    identical -- a false positive in the correctness criterion, which is the one
+    error this study cannot absorb. Non-Latin scripts carry no combining marks
+    here and pass through untouched.
+    """
+    out = str(text).translate(_LIGATURE_TABLE)
+    out = unicodedata.normalize("NFKD", out)
+    return "".join(c for c in out if not unicodedata.combining(c))
+
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_WS_RE = re.compile(r"\s+")
+
+# Word forms are GENERATED from num2words rather than hand-listed, and the table
+# is matched on the whole normalised string only.
+#
+# The opposite direction -- parsing arbitrary text with word2number -- was tried
+# and rejected. On this corpus it accepts 8 of 4,323 distinct answers as
+# numbers, and 5 of those are wrong: "Four Weddings and a Funeral" -> 4,
+# "Marine One" -> 1, "Seven Samurai" -> 7, "Million Dollar Baby" -> 1000000.
+# Collapsing film titles to digits would merge unrelated answers into one
+# cluster and make them correct for each other. A generated exact-match table
+# cannot do that: it only fires on a string that IS a number word.
+#
+# Through 2100 so that YEARS are covered -- a trivia corpus answers "1969" and
+# "nineteen sixty-nine" interchangeably, and years are the most common numeric
+# answer in it. Built once and cached; the cost is measured in milliseconds.
+_NUMERAL_MAX = 2100
+
+
+@lru_cache(maxsize=1)
+def _numeral_table() -> dict[str, str]:
+    """{normalised word form: digit string} for 0.._NUMERAL_MAX, plus round
+    magnitudes above it. Built once, lazily -- num2words is an optional import
+    and the analysis phases must not require it at module load."""
+    try:
+        from num2words import num2words
+    except ImportError:  # pragma: no cover - environment dependent
+        return {}
+    values = list(range(_NUMERAL_MAX + 1)) + [
+        5000, 10000, 100000, 1000000, 1000000000]
+    table = {}
+    for v in values:
+        # Squashed the same way an answer is, so "twenty-one" and "twenty one"
+        # reach the table as one key. Hyphens become spaces rather than being
+        # deleted, or num2words' "twenty-one" would never match a typed
+        # "twenty one".
+        table.setdefault(_squash(num2words(v)), str(v))
+        # Years are SPOKEN differently from cardinals -- 1969 is "nineteen
+        # sixty-nine", not "one thousand nine hundred and sixty-nine" -- and the
+        # spoken form is the one a model writes. num2words carries both.
+        if 1000 <= v <= _NUMERAL_MAX:
+            try:
+                table.setdefault(_squash(num2words(v, to="year")), str(v))
+            except (NotImplementedError, TypeError, OverflowError):
+                pass
+    return table
+
+
+def _squash(text: str) -> str:
+    out = fold_accents(str(text)).lower().strip().replace("-", " ")
+    out = _PUNCT_RE.sub("", out)
+    return _WS_RE.sub(" ", out).strip()
+
+
+def normalise_answer(text, *, case: bool = True, punctuation: bool = True,
+                     articles: bool = True, numerals: bool = True,
+                     accents: bool = True) -> str:
+    """Strip formatting the correctness criterion should never have counted.
+
+    The embedding criterion scores ``"7"`` against a gold ``"Seven"`` at
+    ``e_cos = 0.84`` and calls it wrong -- and bidirectional NLI agrees, so the
+    error is not caught by switching criteria. Measured on the eval split, a
+    tenth to a third of the questions that look like the model is INCONSISTENT
+    (some draws right, some wrong) are really one answer written two ways.
+
+    Applied to the text BEFORE it is embedded, not patched onto the distance
+    afterwards: ``e_cos`` is then a distance between the things being compared
+    rather than between their spellings, and ``s_anchor``, the medoid anchor and
+    the null band all inherit the same treatment for free.
+
+    The raw ``answer`` column is never modified. Generation output is
+    append-only; this is a scoring-time view of it.
+    """
+    out = str(text).strip()
+    if case:
+        out = out.lower()
+    if accents:
+        # Before the punctuation pass, so any compatibility decomposition it
+        # produces (a ligature splitting, a fraction becoming digits and a
+        # fraction slash) is then cleaned up by the same rules as everything
+        # else rather than surviving as a stray symbol.
+        out = fold_accents(out)
+    if punctuation:
+        # Hyphen to space, everything else dropped: "twenty-one" and "twenty
+        # one" are one answer, but "St. Martin's" must become "st martins"
+        # rather than "st martin s".
+        out = _WS_RE.sub(" ", _PUNCT_RE.sub("", out.replace("-", " "))).strip()
+    else:
+        out = _WS_RE.sub(" ", out).strip()
+    if articles:
+        out = _ARTICLE_RE.sub("", out)
+    if numerals:
+        # Whole-string match only. A substring rule would turn "Seven Samurai"
+        # into "7 Samurai".
+        out = _numeral_table().get(out, out)
+    return out
+
+
+def normaliser(cfg: Config):
+    """The configured normalisation as a single callable.
+
+    Returns ``str`` unchanged when disabled, so callers never branch and the
+    "off" path is exactly the old behaviour rather than an approximation of it.
+    """
+    if not bool(cfg.get("judge.normalise.enabled", True)):
+        return lambda t: str(t)
+    opts = dict(case=bool(cfg.get("judge.normalise.case", True)),
+                punctuation=bool(cfg.get("judge.normalise.punctuation", True)),
+                articles=bool(cfg.get("judge.normalise.articles", True)),
+                numerals=bool(cfg.get("judge.normalise.numerals", True)),
+                accents=bool(cfg.get("judge.normalise.accents", True)))
+    return lambda t: normalise_answer(t, **opts)
+
+
+def token_subset_equivalent(answer: str, reference: str) -> bool:
+    """True when one answer is the other with tokens dropped or added.
+
+    This rescues ``"Orton"`` for a gold ``"Joe Orton"`` and ``"Jones"`` for
+    ``"James Jones"`` -- surname-only replies that cosine puts at 0.63 and NLI
+    also rejects. It is NOT a normalisation and cannot be folded into the
+    embedding: it is a claim about a PAIR, so it is applied as an override on
+    the criterion.
+
+    It is off by default and deliberately kept on its own flag, because the same
+    rule accepts ``"Bridge"`` for ``"Bridge Over Troubled Water"``, which is an
+    incomplete answer rather than a differently-spelled one. Enabling it trades
+    a known false-negative class for a known false-positive class; report which
+    was used.
+    """
+    a, b = str(answer).strip(), str(reference).strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    at, bt = a.split(), b.split()
+    if set(at) and set(at).issubset(set(bt)):
+        return True
+    if set(bt) and set(bt).issubset(set(at)):
+        return True
+    return a.startswith(b) or b.startswith(a)
+
+
+def equivalence_mask(cfg: Config, answers, references) -> np.ndarray:
+    """Pairwise equivalence overrides, as a boolean array.
+
+    Normalisation is applied first, so the override only has to carry the cases
+    normalisation cannot: token-level differences rather than spelling ones.
+    """
+    norm = normaliser(cfg)
+    pairs = [(norm(a), norm(r)) for a, r in zip(answers, references)]
+    if bool(cfg.get("judge.equivalence.token_subset", False)):
+        return np.array([token_subset_equivalent(a, r) for a, r in pairs],
+                        dtype=bool)
+    # With normalisation on, exact equality after normalisation already shows up
+    # as e_cos = 0 and needs no override; the array is all-False rather than a
+    # special case, so callers do not branch.
+    return np.zeros(len(pairs), dtype=bool)
+
+
+def correct_by_cosine(answers: pd.DataFrame, tau: float, *,
+                      column: str = "e_cos",
+                      equiv_column: str = "answer_equivalent") -> pd.Series:
+    """The cosine correctness predicate, in ONE place.
+
+    ``tau_sweep`` selects ``tau_star`` against this and every downstream phase
+    applies it. If the two disagreed -- the sweep on the distance alone, the
+    phases on the distance OR an equivalence override -- ``tau_star`` would be
+    chosen to optimise a rule nothing afterwards uses.
+    """
+    base = answers[column] <= float(tau)
+    if equiv_column in answers.columns:
+        base = base | answers[equiv_column].astype("boolean").fillna(False)
+    return base.astype("boolean")
 
 
 class CircularityError(ValueError):
@@ -62,14 +290,25 @@ class EmbeddingSpace:
     dim: int
     mean_centered: bool
     whitened: bool
+    # Applied on the way IN (when the space is built) and on the way OUT (every
+    # lookup), so callers keep passing raw answer text and cannot desynchronise
+    # the two. Identity when normalisation is off.
+    normalise: Callable[[str], str] = str
+
+    def key(self, text) -> str:
+        return self.normalise(str(text))
 
     def get(self, texts) -> np.ndarray:
-        return np.vstack([self.vectors[t] for t in texts])
+        return np.vstack([self.vectors[self.key(t)] for t in texts])
 
 
 def build_embedding_space(cfg: Config, texts, embedder=None) -> EmbeddingSpace:
     embedder = embedder if embedder is not None else build_embedder(cfg)
-    uniq = list(dict.fromkeys(str(t) for t in texts))
+    norm = normaliser(cfg)
+    # Deduplicated AFTER normalising: "7" and "Seven" collapse to one vector, so
+    # the embedder is called once for them and they are at distance 0 by
+    # construction rather than by luck.
+    uniq = list(dict.fromkeys(norm(t) for t in texts))
     mat = np.asarray(embedder.embed(uniq), dtype=np.float64)
     mean_center = bool(cfg.get("embedding.postprocess.mean_center"))
     whiten = bool(cfg.get("embedding.postprocess.whiten"))
@@ -82,7 +321,8 @@ def build_embedding_space(cfg: Config, texts, embedder=None) -> EmbeddingSpace:
         vals = np.clip(vals, 1e-8, None)
         mat = mat @ vecs @ np.diag(vals ** -0.5) @ vecs.T
     return EmbeddingSpace(vectors=dict(zip(uniq, mat)), dim=mat.shape[1],
-                          mean_centered=mean_center, whitened=whiten)
+                          mean_centered=mean_center, whitened=whiten,
+                          normalise=norm)
 
 
 # --------------------------------------------------------------------------
@@ -176,7 +416,9 @@ def score_answers(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
     space = build_embedding_space(cfg, texts, embedder=embedder)
 
     anchors = build_anchors(cfg, answers, questions, space, lm=lm)
-    missing = [t for t in anchors.values if t not in space.vectors]
+    # Through space.key, not raw text: with normalisation on, every raw string
+    # would look absent and the space would be rebuilt on every call.
+    missing = [t for t in anchors.values if space.key(t) not in space.vectors]
     if missing:
         space = build_embedding_space(cfg, texts + missing, embedder=embedder)
 
@@ -196,6 +438,12 @@ def score_answers(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
 
     out["e_cos"] = cosine_distance(emb_a, emb_star)
     out["s_anchor"] = cosine_distance(emb_anchor, emb_a)
+    # A property of the (answer, a_star) PAIR, so it cannot live in the
+    # embedding and is carried as its own column. Written even when the rule is
+    # disabled -- an all-False column keeps every consumer branch-free, and its
+    # presence in the parquet records that the question was asked.
+    out["answer_equivalent"] = equivalence_mask(
+        cfg, out["answer"].astype(str), a_star_texts)
 
     if bool(cfg.get("embedding.postprocess.rank_transform_s")):
         # Only the ordering of s matters downstream, and ranking within a split
@@ -224,7 +472,7 @@ def score_answers(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
 def apply_tau(answers: pd.DataFrame, tau: float,
               column: str = "e_cos") -> pd.DataFrame:
     out = answers.copy()
-    out["correct_cos"] = out[column] <= float(tau)
+    out["correct_cos"] = correct_by_cosine(out, tau, column=column)
     return out
 
 
@@ -256,7 +504,14 @@ def judge_nli(cfg: Config, answers: pd.DataFrame, questions: pd.DataFrame,
         fwd = np.array([nli.entailment_prob(a, r) for a, r in zip(ans, refs)])
         bwd = np.array([nli.entailment_prob(r, a) for a, r in zip(ans, refs)])
 
-    out["correct_nli"] = (np.minimum(fwd, bwd) >= thr) if n else []
+    entailed = (np.minimum(fwd, bwd) >= thr) if n else np.zeros(0, dtype=bool)
+    if n and "answer_equivalent" in out.columns:
+        # Same override as the cosine criterion. "Orton" for "Joe Orton" is not
+        # a bidirectional entailment and NLI rejects it too, so leaving this out
+        # would make the two criteria disagree about a pair on which they have
+        # no actual disagreement.
+        entailed = entailed | out["answer_equivalent"].astype("boolean").fillna(False).to_numpy()
+    out["correct_nli"] = entailed if n else []
     return out
 
 
