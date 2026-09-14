@@ -59,27 +59,53 @@ def reliability_diagram(rel: pd.DataFrame, path: Path, cfg: Config,
                         title: str = "Reliability (answer-level, model-defined bins)") -> Path:
     fig, ax = _new(cfg)
     sub = rel[rel["reportable"]] if "reportable" in rel.columns else rel
-    ax.plot([0, 1], [0, 1], ls="--", lw=1, color="grey")
+    sub = sub.sort_values("v_g")
+    # VC piles up at the top of the scale and p_hat_g can be exactly 0, so the
+    # groups that matter most sit ON the edge of the unit square. Limits of
+    # exactly [0, 1] draw them half-clipped behind the axes; pad past the edge
+    # and mark the edge itself instead.
+    pad = 0.04
+    for edge in (0.0, 1.0):
+        ax.axhline(edge, color="black", lw=0.8, zorder=1)
+        ax.axvline(edge, color="black", lw=0.8, zorder=1)
+    ax.plot([0, 1], [0, 1], ls="--", lw=1, color="grey", zorder=1)
     ax.errorbar(sub["v_g"], sub["p_hat_g"],
                 yerr=[sub["p_hat_g"] - sub["lo"], sub["hi"] - sub["p_hat_g"]],
-                marker="o", ls="none", capsize=3)
-    for _, r in sub.iterrows():
-        ax.annotate(f"n={int(r['n_g'])}", (r["v_g"], r["p_hat_g"]),
-                    textcoords="offset points", xytext=(4, -10), fontsize=8)
+                marker="o", ls="none", capsize=3, zorder=3)
+    # Group sizes go in a table, not beside each point: neighbouring groups can
+    # be 0.01 apart (0.99 vs 1.0), where point labels overprint each other or
+    # land on the wrong marker. Top-left is empty unless a group is
+    # underconfident.
+    rows = [f"{'v_g':>5} {'n_g':>7} {'p_hat':>5}"]
+    rows += [f"{r['v_g']:>5.3f} {int(r['n_g']):>7,} {r['p_hat_g']:>5.2f}"
+             for _, r in sub.iterrows()]
+    ax.text(0.03, 0.97, "\n".join(rows), transform=ax.transAxes, va="top",
+            ha="left", family="monospace", fontsize=7, zorder=4,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
+    ticks = np.linspace(0, 1, 6)
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
     ax.set_xlabel("stated confidence v_g")
     ax.set_ylabel("observed correctness p_hat_g")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_xlim(-pad, 1 + pad)
+    ax.set_ylim(-pad, 1 + pad)
     ax.set_title(title)
     return _save(fig, path, cfg)
 
 
 def vc_histogram(hist: pd.DataFrame, path: Path, cfg: Config, col: str) -> Path:
     fig, ax = _new(cfg)
-    ax.bar(hist["value"], hist["n"], width=0.02)
+    # Same reason as the reliability diagram: the mass sits at 1.0, and a bar
+    # centred on the axis limit is drawn half-clipped.
+    pad = 0.04
+    for edge in (0.0, 1.0):
+        ax.axvline(edge, color="black", lw=0.8, zorder=1)
+    # Narrow enough that adjacent support points (0.99, 1.0) do not overlap.
+    ax.bar(hist["value"], hist["n"], width=0.008, zorder=3)
+    ax.set_xticks(np.linspace(0, 1, 6))
     ax.set_xlabel(col)
     ax.set_ylabel("count")
-    ax.set_xlim(0, 1)
+    ax.set_xlim(-pad, 1 + pad)
     ax.set_title(f"{col}: support and group sizes")
     return _save(fig, path, cfg)
 
