@@ -275,6 +275,14 @@ def budget_table(questions: pd.DataFrame, cfg: Config,
 # The headline comparison (6.5)
 # --------------------------------------------------------------------------
 
+def _grade(auroc: float, grades) -> str:
+    """The label of the highest threshold ``auroc`` reaches."""
+    for threshold, label in sorted(grades, key=lambda g: -float(g[0])):
+        if auroc >= float(threshold):
+            return str(label)
+    return str(sorted(grades, key=lambda g: float(g[0]))[0][1])
+
+
 def u_detection(questions: pd.DataFrame, cfg: Config,
                 signals=("vc_pre", "vc_1", "vc_bar", "H_sem", "h_tok_mean",
                          "largest_cluster_share")) -> pd.DataFrame:
@@ -310,7 +318,7 @@ def u_detection(questions: pd.DataFrame, cfg: Config,
         verdict = ("anti-predictive: most confident exactly where nothing is correct"
                    if est.hi < 0.5 else
                    "blind: interval covers chance" if est.lo <= 0.5 <= est.hi else
-                   "detects U")
+                   _grade(est.value, cfg.get("phase3.u_detection_grades")))
         rows.append({
             "signal": sig, "direction": "lower is worse" if direction < 0 else "higher is worse",
             "auroc_in_U": est.value, "lo": est.lo, "hi": est.hi, "verdict": verdict,

@@ -288,7 +288,7 @@ class Generator:
                                         draw_set)
                 msgs = self._messages(spec, q)
                 gen = self._call(msgs, temperature=temperature, seed=seed)
-                parsed = parse_answer_and_vc(gen.text)
+                parsed = parse_answer_and_vc(gen.text, scale=spec.vc_scale)
 
                 row: dict = {
                     "q_id": q["q_id"], "dataset": q["dataset"], "split": q["split"],
@@ -418,7 +418,7 @@ class Generator:
                 seed = derive_seed(self.run_seed, "pre", q["q_id"], repeat_idx, variant)
                 msgs = self._messages(spec, q)
                 gen = self._call(msgs, temperature=temperature, seed=seed)
-                parsed = parse_vc_only(gen.text)
+                parsed = parse_vc_only(gen.text, scale=spec.vc_scale)
                 rows.append({
                     "q_id": q["q_id"], "dataset": q["dataset"],
                     "repeat_idx": repeat_idx, "vc_pre": parsed.vc,

@@ -28,6 +28,10 @@ class PromptSpec:
     build: Callable[..., list[Message]]
     elicits_vc: bool = True
     notes: str = ""
+    #: How the confidence value is written: "unit" is a decimal in [0, 1],
+    #: "digit10" is one digit 0-9 read as d / 9 (see parsing.digit_to_vc).
+    #: The parser is told the scale; it never guesses it from the reply.
+    vc_scale: Literal["unit", "digit10"] = "unit"
 
 
 REGISTRY: dict[str, PromptSpec] = {}
@@ -269,6 +273,49 @@ register(PromptSpec(variant="answer_clean_short_v1", kind="clean",
                     build=_clean_short_build, elicits_vc=False,
                     notes="short-form clean prompt; matches vc_post_short_v1 "
                           "except for the confidence request"))
+
+
+# --------------------------------------------------------------------------
+# Digit arm: confidence as ONE digit, 0-9.
+#
+# A decimal in [0, 1] spans several tokens, and the model settles on a handful
+# of values -- 0.95 and 1.0 carry nearly every post-hoc answer in the decimal
+# arm. One digit is one token, and there are exactly ten values. The wording is
+# the short arm's, with only the scale changed ("from 0 to 9"): it does not
+# explain what the digits mean. The analysis reads digit d as d / 9 (0 -> 0.0,
+# 9 -> 1.0; see parsing.digit_to_vc), so the ends of the scale are the ends of
+# [0, 1] -- a convention of the analysis, not something the model was told. answer_clean_short_v1 is still the matching clean prompt,
+# since it differs only in carrying no confidence request.
+# --------------------------------------------------------------------------
+
+register(PromptSpec(
+    variant="vc_post_short_digit_v1", kind="post", vc_scale="digit10",
+    build=_post_builder(
+        _SHORT_RULE + "\nThen state your confidence that your answer is correct, "
+        "from 0 to 9.\n"
+        "Reply in exactly this format:\n"
+        "Answer: <your answer>\n"
+        "Confidence: <0-9>"),
+    notes="short-form answers; confidence as one digit 0-9"))
+
+_PRE_DIGIT_BODY = (
+    "You will be shown a question. Do NOT answer it. State only how confident you "
+    "are that you could answer it correctly if asked, from 0 to 9.\n"
+    "Reply in exactly this format:\n"
+    "Confidence: <0-9>"
+)
+
+def _pre_digit_build(question: str, **_: object) -> list[Message]:
+    return [
+        {"role": "system", "content": _PRE_DIGIT_BODY},
+        {"role": "user", "content": f"Question: {question}"},
+    ]
+
+
+register(PromptSpec(variant="vc_pre_digit_v1", kind="pre", vc_scale="digit10",
+                    build=_pre_digit_build,
+                    notes="pre-hoc; confidence as one digit 0-9; otherwise worded "
+                          "as vc_pre_v1"))
 
 
 # --------------------------------------------------------------------------

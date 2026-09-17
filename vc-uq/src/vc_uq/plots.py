@@ -56,10 +56,16 @@ def hazard_curve(hz: pd.DataFrame, path: Path, cfg: Config) -> Path:
 
 
 def reliability_diagram(rel: pd.DataFrame, path: Path, cfg: Config,
-                        title: str = "Reliability (answer-level, model-defined bins)") -> Path:
+                        title: str = "Reliability (answer-level, model-defined bins)",
+                        scale: str = "unit") -> Path:
     fig, ax = _new(cfg)
     sub = rel[rel["reportable"]] if "reportable" in rel.columns else rel
     sub = sub.sort_values("v_g")
+    # A 0-9 arm is drawn in digits: x = 9 * v_g, so the diagonal still means
+    # "stated = observed" (digit d claims d / 9).
+    top = 9.0 if scale == "digit10" else 1.0
+    x = sub["v_g"] * top
+    xname = "digit" if scale == "digit10" else "v_g"
     # VC piles up at the top of the scale and p_hat_g can be exactly 0, so the
     # groups that matter most sit ON the edge of the unit square. Limits of
     # exactly [0, 1] draw them half-clipped behind the axes; pad past the edge
@@ -67,45 +73,52 @@ def reliability_diagram(rel: pd.DataFrame, path: Path, cfg: Config,
     pad = 0.04
     for edge in (0.0, 1.0):
         ax.axhline(edge, color="black", lw=0.8, zorder=1)
-        ax.axvline(edge, color="black", lw=0.8, zorder=1)
-    ax.plot([0, 1], [0, 1], ls="--", lw=1, color="grey", zorder=1)
-    ax.errorbar(sub["v_g"], sub["p_hat_g"],
+        ax.axvline(edge * top, color="black", lw=0.8, zorder=1)
+    ax.plot([0, top], [0, 1], ls="--", lw=1, color="grey", zorder=1)
+    ax.errorbar(x, sub["p_hat_g"],
                 yerr=[sub["p_hat_g"] - sub["lo"], sub["hi"] - sub["p_hat_g"]],
                 marker="o", ls="none", capsize=3, zorder=3)
     # Group sizes go in a table, not beside each point: neighbouring groups can
     # be 0.01 apart (0.99 vs 1.0), where point labels overprint each other or
     # land on the wrong marker. Top-left is empty unless a group is
     # underconfident.
-    rows = [f"{'v_g':>5} {'n_g':>7} {'p_hat':>5}"]
-    rows += [f"{r['v_g']:>5.3f} {int(r['n_g']):>7,} {r['p_hat_g']:>5.2f}"
+    rows = [f"{xname:>5} {'n_g':>7} {'p_hat':>5}"]
+    rows += [f"{r['v_g'] * top:>5.3g} {int(r['n_g']):>7,} {r['p_hat_g']:>5.2f}"
              for _, r in sub.iterrows()]
     ax.text(0.03, 0.97, "\n".join(rows), transform=ax.transAxes, va="top",
             ha="left", family="monospace", fontsize=7, zorder=4,
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
     ticks = np.linspace(0, 1, 6)
-    ax.set_xticks(ticks)
+    ax.set_xticks(np.arange(10) if scale == "digit10" else ticks)
     ax.set_yticks(ticks)
-    ax.set_xlabel("stated confidence v_g")
+    ax.set_xlabel("stated confidence (digit 0-9)" if scale == "digit10"
+                  else "stated confidence v_g")
     ax.set_ylabel("observed correctness p_hat_g")
-    ax.set_xlim(-pad, 1 + pad)
+    ax.set_xlim(-pad * top, top * (1 + pad))
     ax.set_ylim(-pad, 1 + pad)
     ax.set_title(title)
     return _save(fig, path, cfg)
 
 
-def vc_histogram(hist: pd.DataFrame, path: Path, cfg: Config, col: str) -> Path:
+def vc_histogram(hist: pd.DataFrame, path: Path, cfg: Config, col: str,
+                 scale: str = "unit") -> Path:
     fig, ax = _new(cfg)
-    # Same reason as the reliability diagram: the mass sits at 1.0, and a bar
-    # centred on the axis limit is drawn half-clipped.
+    top = 9.0 if scale == "digit10" else 1.0
+    # Same reason as the reliability diagram: the mass sits at the top of the
+    # scale, and a bar centred on the axis limit is drawn half-clipped.
     pad = 0.04
     for edge in (0.0, 1.0):
-        ax.axvline(edge, color="black", lw=0.8, zorder=1)
+        ax.axvline(edge * top, color="black", lw=0.8, zorder=1)
     # Narrow enough that adjacent support points (0.99, 1.0) do not overlap.
-    ax.bar(hist["value"], hist["n"], width=0.008, zorder=3)
-    ax.set_xticks(np.linspace(0, 1, 6))
-    ax.set_xlabel(col)
+    ax.bar(hist["value"] * top, hist["n"], width=0.008 * top, zorder=3)
+    if scale == "digit10":
+        ax.set_xticks(np.arange(10))
+        ax.set_xlabel(f"{col} (digit 0-9)")
+    else:
+        ax.set_xticks(np.linspace(0, 1, 6))
+        ax.set_xlabel(col)
     ax.set_ylabel("count")
-    ax.set_xlim(-pad, 1 + pad)
+    ax.set_xlim(-pad * top, top * (1 + pad))
     ax.set_title(f"{col}: support and group sizes")
     return _save(fig, path, cfg)
 

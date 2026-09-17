@@ -229,6 +229,32 @@ def test_pre_hoc_parser_needs_no_answer():
     assert p.status == OK
 
 
+def test_digit_scale_reads_one_digit_as_d_over_9():
+    from vc_uq.parsing import (DIGIT10, OK, OUT_OF_RANGE, UNPARSEABLE_VALUE,
+                               parse_answer_and_vc, parse_vc_only)
+    p = parse_answer_and_vc("Answer: Lisbon\nConfidence: 9", scale=DIGIT10)
+    assert p.answer == "Lisbon"
+    assert p.vc == pytest.approx(1.0) and p.status == OK
+    assert parse_vc_only("Confidence: 0", scale=DIGIT10).vc == pytest.approx(0.0)
+    assert parse_vc_only("Confidence: 7.", scale=DIGIT10).vc == pytest.approx(7 / 9)
+    # A number on a scale the model was not asked for is reported, never rescaled.
+    for bad in ("10", "85", "0.9", "90%", "-1"):
+        q = parse_vc_only(f"Confidence: {bad}", scale=DIGIT10)
+        assert q.vc is None and q.status == OUT_OF_RANGE, bad
+    assert parse_vc_only("Confidence: high", scale=DIGIT10).status == UNPARSEABLE_VALUE
+    # The unit scale is untouched: a lone digit there is still a decimal.
+    assert parse_vc_only("Confidence: 1").vc == pytest.approx(1.0)
+    assert parse_vc_only("Confidence: 7").status == OUT_OF_RANGE
+
+
+def test_digit_prompts_declare_their_scale():
+    from vc_uq import prompts
+    for v in ("vc_post_short_digit_v1", "vc_pre_digit_v1"):
+        assert prompts.get(v).vc_scale == "digit10", v
+    assert prompts.get("vc_post_short_v1").vc_scale == "unit"
+    assert prompts.get("vc_pre_v1").vc_scale == "unit"
+
+
 # --------------------------------------------------------------------------
 # Phase 0 hand labels (the real, non-simulated path)
 # --------------------------------------------------------------------------
@@ -937,15 +963,16 @@ def test_prehoc_prompt_carries_no_answer_and_is_marked_pre():
     """vc_pre and vc_post are different constructs; the registry encodes which."""
     from vc_uq import prompts
 
-    spec = prompts.get("vc_pre_v1")
-    assert spec.kind == "pre"
-    body = " ".join(m["content"] for m in spec.build(question="Q"))
-    assert "Do NOT answer" in body
-    assert "Answer:" not in body, "a pre-hoc prompt must not solicit an answer"
+    for variant in ("vc_pre_v1", "vc_pre_digit_v1"):
+        spec = prompts.get(variant)
+        assert spec.kind == "pre"
+        body = " ".join(m["content"] for m in spec.build(question="Q"))
+        assert "Do NOT answer" in body
+        assert "Answer:" not in body, "a pre-hoc prompt must not solicit an answer"
 
     assert all(prompts.get(v).kind == "post"
                for v in prompts.variants("post"))
-    assert prompts.variants("pre") == ["vc_pre_v1"]
+    assert prompts.variants("pre") == ["vc_pre_digit_v1", "vc_pre_v1"]
 
 
 def test_paraphrase_variants_differ_only_in_wording():
@@ -2441,3 +2468,13 @@ def test_accent_folding_can_be_switched_off(cfg):
     assert off("La Bohème") != off("La Boheme")
     on = normaliser(cfg)
     assert on("La Bohème") == on("La Boheme")
+
+
+def test_u_detection_grades_by_auroc_not_by_beating_chance():
+    """0.52 with a tight interval is distinguishable from chance, not a detector."""
+    from vc_uq.survival import _grade
+    grades = load_config(None, []).get("phase3.u_detection_grades")
+    assert _grade(0.52, grades) == "near chance"
+    assert _grade(0.72, grades) == "weak"
+    assert _grade(0.85, grades) == "moderate"
+    assert _grade(0.93, grades) == "detects U"

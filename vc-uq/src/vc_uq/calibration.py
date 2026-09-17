@@ -37,6 +37,20 @@ def vc_histogram(df: pd.DataFrame, col: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def with_digit(table: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Add ``digit`` (col * 9) beside a VC column from a 0-9 arm.
+
+    Parsing stores digit d as d / 9 (parsing.digit_to_vc); this is the inverse,
+    for reading. A per-question mean of repeats gives a mean digit, not an
+    integer.
+    """
+    if table.empty:
+        return table
+    out = table.copy()
+    out.insert(out.columns.get_loc(col) + 1, "digit", (out[col] * 9).round(3))
+    return out
+
+
 def discreteness_summary(df: pd.DataFrame, col: str,
                          top_k: int = 5) -> dict:
     hist = vc_histogram(df, col)

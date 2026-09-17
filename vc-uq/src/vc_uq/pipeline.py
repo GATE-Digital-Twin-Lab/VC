@@ -35,7 +35,7 @@ from typing import Any
 
 import pandas as pd
 
-from . import calibration, cluster, invariance, judge, phase0, plots, survival, transfer
+from . import calibration, cluster, invariance, judge, phase0, plots, prompts, survival, transfer
 from .backends import build_embedder, build_nli
 from .clm import build_traces, run_phase4, stratified_discount
 from .config import Config
@@ -396,6 +396,12 @@ def step5_descriptive(state: PipelineState) -> PipelineState:
     hist_post = calibration.vc_histogram(answers, "vc_post")
     hist_pre = calibration.vc_histogram(questions, "vc_pre")
     rel = calibration.reliability(answers, cfg)
+    # A 0-9 arm is read and plotted in digits; the math above stays on [0, 1].
+    scale = prompts.get(cfg.get("generation.prompt_variant_post")).vc_scale
+    if scale == "digit10":
+        hist_post = calibration.with_digit(hist_post, "value")
+        hist_pre = calibration.with_digit(hist_pre, "value")
+        rel = calibration.with_digit(rel, "v_g")
     mono = calibration.monotonicity(rel)
     var = calibration.vc_variance_decomposition(answers, cfg)
     info = calibration.information_gain(questions, cfg)
@@ -415,9 +421,10 @@ def step5_descriptive(state: PipelineState) -> PipelineState:
         "ece_model_bins": calibration.model_defined_ece(rel),
     })
     if len(rel):
-        plots.reliability_diagram(rel, store.figure_path("reliability"), cfg)
+        plots.reliability_diagram(rel, store.figure_path("reliability"), cfg, scale=scale)
     if len(hist_post):
-        plots.vc_histogram(hist_post, store.figure_path("vc_hist_post"), cfg, "vc_post")
+        plots.vc_histogram(hist_post, store.figure_path("vc_hist_post"), cfg, "vc_post",
+                           scale=scale)
 
     state.results["step5_descriptive"] = {
         "reliability": rel.to_dict("records"), "monotonicity": mono,
